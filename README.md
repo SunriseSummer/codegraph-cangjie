@@ -253,7 +253,7 @@ With the index available, the agent answers from a couple of `codegraph_explore`
 
 ## Built for speed — the Rust kernel
 
-CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScript, JavaScript, Java, Python, Go, C, C++, Rust, C#, Ruby, PHP, Swift, Kotlin, Scala, Dart, R, Lua, Luau (Metal and CUDA ride the C++ path) — parse in compiled code with one boundary crossing per file. Every language shipped only after its graphs proved **byte-for-byte identical** to the reference engine on real repositories, from small libraries up to the Linux kernel; platforms without a prebuilt binary and files with syntax errors fall back per-file automatically, same graph either way.
+CodeGraph's parsing engine is a **native Rust kernel**: 21 languages — TypeScript, JavaScript, Java, Python, Go, C, C++, Rust, C#, Ruby, PHP, Swift, Kotlin, Scala, Dart, R, Lua, Luau, and Cangjie (Metal and CUDA ride the C++ path) — parse in compiled code with one boundary crossing per file. Every language shipped only after its graphs proved **byte-for-byte identical** to the reference engine on real repositories, from small libraries up to the Linux kernel; platforms without a prebuilt binary and files with syntax errors fall back per-file automatically, same graph either way.
 
 **And it scales itself to the machine it's on.** Worker pools, parallel resolution, and analysis caches are sized from what the system actually has — real core counts (container/cgroup-aware, so a VPS that grants 2 cores gets sized for 2, not the host's 64), honestly-measured available RAM on macOS and Linux, and the measured cost of *your* project's resolution work:
 
@@ -267,13 +267,13 @@ CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScr
 
 | | |
 |---|---|
-| **Native Rust Kernel** | Parsing and extraction run in a compiled Rust engine for 20 languages — with graphs verified byte-for-byte identical to the reference engine, and automatic per-file fallback so nothing ever breaks |
+| **Native Rust Kernel** | Parsing and extraction run in a compiled Rust engine for 21 languages — with graphs verified byte-for-byte identical to the reference engine, and automatic per-file fallback so nothing ever breaks |
 | **Adapts to Your Machine** | Sizes its worker pools and caches from what the system actually has — real core counts (container-aware), honest available RAM, measured per-project cost. A workstation gets the full parallel pipeline; a 2-core VPS gets one tuned to finish reliably |
 | **Surgical Context** | One tool call returns entry points, related symbols, and code snippets — no slow file-by-file exploration |
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Cangjie, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -486,7 +486,7 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Extraction** — a native **Rust kernel** parses source with [tree-sitter](https://tree-sitter.github.io/) grammars compiled into it, extracting nodes (functions, classes, methods) and edges (calls, imports, extends, implements) for 20 languages; remaining languages and per-file fallbacks use the same extraction logic on the portable engine, producing identical graphs.
+1. **Extraction** — a native **Rust kernel** parses source with [tree-sitter](https://tree-sitter.github.io/) grammars compiled into it, extracting nodes (functions, classes, methods) and edges (calls, imports, extends, implements) for 21 languages; remaining languages and per-file fallbacks use the same extraction logic on the portable engine, producing identical graphs.
 
 2. **Storage** — Everything goes into a local SQLite database (`.codegraph/codegraph.db`) with FTS5 full-text search.
 
@@ -780,6 +780,7 @@ is written):
 | Kotlin | `.kt`, `.kts` | Full support |
 | Scala | `.scala`, `.sc` | Full support (classes, traits, methods, type aliases, Scala 3 enums) |
 | Dart | `.dart` | Full support |
+| Cangjie (仓颉 1.0.5) | `.cj` | Full support (packages and all import forms; functions, classes, structs, interfaces, enums and enum constructors, type aliases, extensions, primary constructors, properties, fields/constants/variables, generics, inheritance/conformance, calls/instantiations and typed member references; native Rust extraction with per-file WASM fallback) |
 | Svelte | `.svelte` | Full support (script extraction, Svelte 5 runes, SvelteKit routes) |
 | Vue | `.vue` | Full support (script + script-setup extraction, Nuxt page/API/middleware routes) |
 | Astro | `.astro` | Full support (frontmatter + script extraction, template component/call references, `src/pages/` routes) |

@@ -17,6 +17,7 @@
 #![deny(clippy::all)]
 
 mod buffers;
+mod cangjie;
 mod ccpp;
 mod cfnptr;
 mod csharp;
@@ -231,6 +232,7 @@ pub fn extract_file(file_path: String, content: String, language: String) -> Res
         "lua" | "luau" => lua::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
         "scala" => scala::extract(&file_path, &content).map_err(Error::from_reason)?,
         "dart" => dart::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "cangjie" => cangjie::extract(&file_path, &content).map_err(Error::from_reason)?,
         _ => tsjs::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
     };
     Ok(ExtractBuffers {

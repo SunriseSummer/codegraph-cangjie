@@ -1013,6 +1013,8 @@ export class TreeSitterExtractor {
         this.extractInterface(node);
       } else if (classification === 'trait') {
         this.extractClass(node, 'trait');
+      } else if (classification === 'extension') {
+        this.extractClass(node, 'extension');
       } else {
         this.extractClass(node);
       }
@@ -1020,7 +1022,12 @@ export class TreeSitterExtractor {
     }
     // Extra class node types (e.g. Dart mixin_declaration, extension_declaration)
     else if (this.extractor.extraClassNodeTypes?.includes(nodeType)) {
-      this.extractClass(node);
+      if (this.language === 'cangjie') {
+        const classification = this.extractor.classifyClassNode?.(node) ?? 'class';
+        this.extractClass(node, classification === 'extension' ? 'extension' : 'class');
+      } else {
+        this.extractClass(node);
+      }
       skipChildren = true;
     }
     // Check for method declarations (only if not already handled by functionTypes)
@@ -1248,6 +1255,11 @@ export class TreeSitterExtractor {
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
     }
+    // Cangjie represents `receiver.member` as a suffix node. Non-call member
+    // access is still a graph dependency and is handled separately.
+    else if (this.language === 'cangjie' && nodeType === 'fieldAccess') {
+      this.extractCangjieFieldRead(node);
+    }
     // `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
     // produce an `instantiates` reference. Children still walked so
     // nested calls inside the constructor args (`new Foo(bar())`) get
@@ -1345,6 +1357,7 @@ export class TreeSitterExtractor {
       startColumn: node.startPosition.column,
       endColumn: node.endPosition.column,
       updatedAt: Date.now(),
+      typeParameters: this.extractor?.getTypeParameters?.(node, this.source),
       ...extra,
     };
 
@@ -1495,7 +1508,8 @@ export class TreeSitterExtractor {
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
-      parentNode.kind === 'module'
+      parentNode.kind === 'module' ||
+      parentNode.kind === 'extension'
     );
   }
 
@@ -1690,15 +1704,31 @@ export class TreeSitterExtractor {
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
+    const signature = this.language === 'cangjie'
+      ? this.extractor.getSignature?.(node, this.source)
+      : undefined;
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
+      signature,
       visibility,
       isExported,
     });
     if (!classNode) return;
+
+    // Extension blocks are first-class containers, but also depend on the
+    // concrete type whose API they augment.
+    if (kind === 'extension') {
+      this.unresolvedReferences.push({
+        fromNodeId: classNode.id,
+        referenceName: name,
+        referenceKind: 'references',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
@@ -1776,6 +1806,9 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
+    const isExported = this.language === 'cangjie'
+      ? this.extractor.isExported?.(node, this.source)
+      : undefined;
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
     const returnType = this.extractor.getReturnType?.(node, this.source);
@@ -1783,6 +1816,7 @@ export class TreeSitterExtractor {
       docstring,
       signature,
       visibility,
+      isExported,
       isAsync,
       isStatic,
       returnType,
@@ -1836,12 +1870,20 @@ export class TreeSitterExtractor {
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
+    const signature = this.language === 'cangjie'
+      ? this.extractor.getSignature?.(node, this.source)
+      : undefined;
+    const visibility = this.language === 'cangjie'
+      ? this.extractor.getVisibility?.(node)
+      : undefined;
     const isExported = this.extractor.isExported?.(node, this.source);
 
     const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
 
     const interfaceNode = this.createNode(kind, name, node, {
       docstring,
+      signature,
+      visibility,
       isExported,
     });
     if (!interfaceNode) return;
@@ -1872,16 +1914,23 @@ export class TreeSitterExtractor {
     // Skip forward declarations and type references (no body = not a definition)
     // — EXCEPT C# positional records (`record struct M(decimal Amount);`),
     // complete definitions with no body block. (#831)
-    const body = getChildByField(node, this.extractor.bodyField);
+    const body = this.language === 'cangjie'
+      ? this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField)
+      : getChildByField(node, this.extractor.bodyField);
     if (!body && node.type !== 'record_declaration') return;
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
+    const signature = this.language === 'cangjie'
+      ? this.extractor.getSignature?.(node, this.source)
+      : undefined;
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     const structNode = this.createNode('struct', name, node, {
       docstring,
+      signature,
       visibility,
       isExported,
     });
@@ -1921,11 +1970,15 @@ export class TreeSitterExtractor {
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
+    const signature = this.language === 'cangjie'
+      ? this.extractor.getSignature?.(node, this.source)
+      : undefined;
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
     const enumNode = this.createNode('enum', name, node, {
       docstring,
+      signature,
       visibility,
       isExported,
     });
@@ -1956,10 +2009,19 @@ export class TreeSitterExtractor {
    * Handles multi-case declarations (Swift: `case put, delete`) and single-case patterns.
    */
   private extractEnumMembers(node: SyntaxNode): void {
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    const owner = ownerId ? this.nodes.find((candidate) => candidate.id === ownerId) : undefined;
+    const extra = (member: SyntaxNode): Partial<Node> => this.language === 'cangjie'
+      ? {
+          signature: this.extractor?.getEnumMemberSignature?.(member, this.source),
+          visibility: owner?.visibility,
+          isExported: owner?.isExported,
+        }
+      : {};
     // Try field-based name first (e.g. Rust enum_variant has a 'name' field)
     const nameNode = getChildByField(node, 'name');
     if (nameNode) {
-      this.createNode('enum_member', getNodeText(nameNode, this.source), node);
+      this.createNode('enum_member', getNodeText(nameNode, this.source), node, extra(node));
       return;
     }
 
@@ -1968,14 +2030,14 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child && (child.type === 'simple_identifier' || child.type === 'identifier' || child.type === 'property_identifier')) {
-        this.createNode('enum_member', getNodeText(child, this.source), child);
+        this.createNode('enum_member', getNodeText(child, this.source), child, extra(child));
         found = true;
       }
     }
 
     // If the node itself IS the identifier (e.g. TS property_identifier directly in enum body)
     if (!found && node.namedChildCount === 0) {
-      this.createNode('enum_member', getNodeText(node, this.source), node);
+      this.createNode('enum_member', getNodeText(node, this.source), node, extra(node));
     }
   }
 
@@ -2893,6 +2955,12 @@ export class TreeSitterExtractor {
     const name = extractName(node, this.source, this.extractor);
     if (name === '<anonymous>') return false;
     const docstring = getPrecedingDocstring(node, this.source);
+    const signature = this.language === 'cangjie'
+      ? this.extractor.getSignature?.(node, this.source)
+      : undefined;
+    const visibility = this.language === 'cangjie'
+      ? this.extractor.getVisibility?.(node)
+      : undefined;
     const isExported = this.extractor.isExported?.(node, this.source);
 
     // Check if this type alias is actually a struct or interface definition
@@ -2900,7 +2968,12 @@ export class TreeSitterExtractor {
     const resolvedKind = this.extractor.resolveTypeAliasKind?.(node, this.source);
 
     if (resolvedKind === 'struct') {
-      const structNode = this.createNode('struct', name, node, { docstring, isExported });
+      const structNode = this.createNode('struct', name, node, {
+        docstring,
+        signature,
+        visibility,
+        isExported,
+      });
       if (!structNode) return true;
       // Visit body children for field extraction
       this.nodeStack.push(structNode.id);
@@ -2921,7 +2994,12 @@ export class TreeSitterExtractor {
     }
 
     if (resolvedKind === 'enum') {
-      const enumNode = this.createNode('enum', name, node, { docstring, isExported });
+      const enumNode = this.createNode('enum', name, node, {
+        docstring,
+        signature,
+        visibility,
+        isExported,
+      });
       if (!enumNode) return true;
       this.nodeStack.push(enumNode.id);
       // Find the inner enum type child (e.g. C: typedef enum { ... } name)
@@ -2949,7 +3027,12 @@ export class TreeSitterExtractor {
 
     if (resolvedKind === 'interface') {
       const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
-      const interfaceNode = this.createNode(kind, name, node, { docstring, isExported });
+      const interfaceNode = this.createNode(kind, name, node, {
+        docstring,
+        signature,
+        visibility,
+        isExported,
+      });
       if (!interfaceNode) return true;
       // Extract interface inheritance from the inner type node
       const typeChild = getChildByField(node, 'type');
@@ -2966,6 +3049,8 @@ export class TreeSitterExtractor {
 
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
+      signature,
+      visibility,
       isExported,
     });
 
@@ -3681,11 +3766,149 @@ export class TreeSitterExtractor {
     return this.erlangAtomMacros.get(macroName) ?? null;
   }
 
+  /**
+   * Record a statically named Cangjie field/property read. Calls are skipped
+   * because the enclosing callSuffix produces the stronger `calls` edge.
+   */
+  private extractCangjieFieldRead(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    const parent = node.parent;
+    if (!callerId || !parent || parent.type !== 'postfixExpression') return;
+
+    const next = parent.nextNamedSibling;
+    if (
+      next &&
+      (next.type === 'callSuffix' || next.type === 'trailingLambdaExpression')
+    ) {
+      return;
+    }
+
+    const memberAtomic = node.namedChildren.find(
+      (child: SyntaxNode) => child.type === 'atomicVariable'
+    );
+    const memberBinding = memberAtomic?.namedChildren.find(
+      (child: SyntaxNode) =>
+        child.type === 'varBindingPattern' || child.type === 'identifier'
+    );
+    const member = memberBinding
+      ? getNodeText(memberBinding, this.source).trim()
+      : '';
+    if (!member) return;
+
+    const receiver = node.previousNamedSibling;
+    let referenceName: string | null = null;
+    if (receiver?.type === 'atomicVariable') {
+      const receiverBinding = receiver.namedChildren.find(
+        (child: SyntaxNode) =>
+          child.type === 'varBindingPattern' || child.type === 'identifier'
+      );
+      const receiverName = receiverBinding
+        ? getNodeText(receiverBinding, this.source).trim()
+        : '';
+      if (receiverName) referenceName = `${receiverName}.${member}`;
+    } else if (
+      receiver?.type === 'thisSuperExpression' &&
+      getNodeText(receiver, this.source).trim() === 'this'
+    ) {
+      referenceName = `this.${member}`;
+    } else if (receiver?.type === 'postfixExpression') {
+      const optionalReceiver = getNodeText(receiver, this.source)
+        .replace(/\s+/g, '')
+        .match(/^([\p{L}_][\p{L}\p{N}_]*)\?$/u)?.[1];
+      if (optionalReceiver) referenceName = `${optionalReceiver}.${member}`;
+    }
+    if (!referenceName) return;
+
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName,
+      referenceKind: 'references',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
+
+    // Cangjie calls are suffixes of a postfixExpression rather than standalone
+    // call nodes: `f()` is [atomicVariable, callSuffix], and `x.f()` nests the
+    // receiver/field postfix immediately before the call suffix.
+    if (
+      this.language === 'cangjie' &&
+      (node.type === 'callSuffix' || node.type === 'trailingLambdaExpression')
+    ) {
+      const previous = node.previousNamedSibling;
+      if (!previous) return;
+      if (node.type === 'trailingLambdaExpression' && previous.type === 'callSuffix') return;
+
+      const emit = (
+        referenceName: string,
+        referenceKind: 'calls' | 'instantiates' = 'calls'
+      ): void => {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName,
+          referenceKind,
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      };
+      const atomicName = (candidate: SyntaxNode): string => {
+        const binding = candidate.namedChildren.find(
+          (child: SyntaxNode) =>
+            child.type === 'varBindingPattern' || child.type === 'identifier'
+        );
+        return binding ? getNodeText(binding, this.source).trim() : '';
+      };
+      const emitMethodCall = (fieldAccess: SyntaxNode): void => {
+        const memberNode = fieldAccess.namedChildren.find(
+          (child: SyntaxNode) => child.type === 'atomicVariable'
+        );
+        const methodName = memberNode ? atomicName(memberNode) : '';
+        if (!methodName) return;
+        const receiver = fieldAccess.previousNamedSibling;
+        if (receiver?.type === 'atomicVariable') {
+          const receiverName = atomicName(receiver);
+          emit(receiverName ? `${receiverName}.${methodName}` : methodName);
+        } else if (receiver?.type === 'thisSuperExpression') {
+          if (getNodeText(receiver, this.source).trim() === 'this') {
+            emit(`this.${methodName}`);
+          }
+        } else if (receiver?.type === 'postfixExpression') {
+          let receiverText = getNodeText(receiver, this.source).replace(/\s+/g, '');
+          for (let i = 0; i < 4; i++) {
+            receiverText = receiverText.replace(/\([^()]*\)/g, '()');
+          }
+          // `?.` is represented as a postfix `questAccess` followed by the
+          // ordinary field/call suffix. Preserve the declared receiver name.
+          receiverText = receiverText.replace(/\?$/, '');
+          if (receiverText && receiverText.length <= 240) {
+            emit(`${receiverText}.${methodName}`);
+          }
+        }
+      };
+
+      if (previous.type === 'atomicVariable') {
+        const name = atomicName(previous);
+        if (!name) return;
+        // Cangjie has no `new`; conventional type names are constructor calls.
+        if (/^\p{Lu}/u.test(name)) emit(name, 'instantiates');
+        else emit(name);
+      } else if (previous.type === 'fieldAccess') {
+        emitMethodCall(previous);
+      } else if (previous.type === 'thisSuperExpression') {
+        if (getNodeText(previous, this.source).trim() === 'this') emit('init');
+      } else if (previous.type === 'postfixExpression') {
+        const suffix = previous.namedChild(previous.namedChildCount - 1);
+        if (suffix?.type === 'fieldAccess') emitMethodCall(suffix);
+      }
+      return;
+    }
 
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
@@ -5142,6 +5365,8 @@ export class TreeSitterExtractor {
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
+      } else if (this.language === 'cangjie' && nodeType === 'fieldAccess') {
+        this.extractCangjieFieldRead(node);
       } else if (INSTANTIATION_KINDS.has(nodeType) || this.isVbnetConstructorShapedArrayCreation(node)) {
         // `new Foo()` inside a function body — emit an `instantiates`
         // reference. Without this branch the body walker only knew
@@ -5258,7 +5483,16 @@ export class TreeSitterExtractor {
         else if (classification === 'enum') this.extractEnum(node);
         else if (classification === 'interface') this.extractInterface(node);
         else if (classification === 'trait') this.extractClass(node, 'trait');
+        else if (classification === 'extension') this.extractClass(node, 'extension');
         else this.extractClass(node);
+        return;
+      }
+      if (
+        this.language === 'cangjie' &&
+        this.extractor!.extraClassNodeTypes?.includes(nodeType)
+      ) {
+        const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
+        this.extractClass(node, classification === 'extension' ? 'extension' : 'class');
         return;
       }
       if (this.extractor!.structTypes.includes(nodeType)) {
@@ -5289,6 +5523,34 @@ export class TreeSitterExtractor {
    * Extract inheritance relationships
    */
   private extractInheritance(node: SyntaxNode, classId: string): void {
+    // Cangjie places every `<:` target in a direct superOrInterface child.
+    // Interfaces extend all targets; structs/enums/extensions implement them.
+    // A class may have one superclass, which must be listed first.
+    if (this.language === 'cangjie') {
+      const supers = node.namedChildren.filter(
+        (child: SyntaxNode) => child.type === 'superOrInterface'
+      );
+      supers.forEach((supertype: SyntaxNode, index: number) => {
+        const target = supertype.namedChild(0);
+        if (!target) return;
+        const name = getNodeText(target, this.source).trim();
+        if (!name) return;
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: name,
+          referenceKind:
+            node.type === 'classDefinition'
+              ? (index === 0 ? 'extends' : 'implements')
+              : node.type === 'interfaceDefinition'
+                ? 'extends'
+                : 'implements',
+          line: target.startPosition.row + 1,
+          column: target.startPosition.column,
+        });
+      });
+      return;
+    }
+
     // Objective-C @interface MyClass : NSObject <ProtoA, ProtoB>
     if (node.type === 'class_interface') {
       const superclass = getChildByField(node, 'superclass');

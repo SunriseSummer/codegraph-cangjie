@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  cangjie: 'tree-sitter-cangjie.wasm',
 };
 
 /**
@@ -170,6 +171,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // Cangjie 1.0.5 source files.
+  '.cj': 'cangjie',
 };
 
 /**
@@ -338,6 +341,10 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // Cangjie 1.0.5 grammar, built from the checked-in parser.c/scanner.c
+  // under treesitter-cangjie. The same generated C sources are compiled by
+  // the native kernel, keeping the Rust and WASM paths revision-aligned.
+  'cangjie',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -654,6 +661,7 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
+    cangjie: 'Cangjie (仓颉)',
     arkts: 'ArkTS',
     unknown: 'Unknown',
   };

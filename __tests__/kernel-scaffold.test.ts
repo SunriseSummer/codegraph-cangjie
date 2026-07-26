@@ -72,8 +72,8 @@ describe.skipIf(!kernelBuilt)('kernel scaffold', () => {
     expect(info.languages).toContain('javascript');
   });
 
-  it('TS/JS family + Java + Python + Go route to the kernel by default; others stay wasm', () => {
-    for (const lang of ['typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go', 'ruby', 'php', 'swift', 'kotlin', 'scala'] as const) {
+  it('gate-passed languages route to the kernel by default; others stay wasm', () => {
+    for (const lang of ['typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go', 'ruby', 'php', 'swift', 'kotlin', 'scala', 'cangjie'] as const) {
       expect(kernelRoutes(lang), lang).toBe(true);
     }
     expect(kernelRoutes('pascal')).toBe(false);

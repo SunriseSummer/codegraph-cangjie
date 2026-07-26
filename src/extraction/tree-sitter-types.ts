@@ -150,6 +150,10 @@ export interface LanguageExtractor {
 
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
+  /** Extract declared generic type parameter names from a symbol. */
+  getTypeParameters?: (node: SyntaxNode, source: string) => string[] | undefined;
+  /** Extract an enum constructor/case payload signature. */
+  getEnumMemberSignature?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */
@@ -212,7 +216,7 @@ export interface LanguageExtractor {
    * Classify a class_declaration node when the grammar reuses one node type
    * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
    */
-  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
+  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait' | 'extension';
 
   /**
    * Classify a methodTypes node when the grammar reuses one node type for

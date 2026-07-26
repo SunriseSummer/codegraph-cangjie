@@ -111,12 +111,32 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
       sibling.type === 'comment' ||
       sibling.type === 'line_comment' ||
       sibling.type === 'block_comment' ||
-      sibling.type === 'documentation_comment'
+      sibling.type === 'documentation_comment' ||
+      sibling.type === 'lineComment' ||
+      sibling.type === 'blockComment'
     ) {
       comments.unshift(getNodeText(sibling, source));
       sibling = sibling.previousNamedSibling;
     } else {
       break;
+    }
+  }
+
+  // The Cangjie grammar can attach comment extras to the preceding
+  // declaration. Recover only an adjacent trailing run, so unrelated comments
+  // never become a declaration's documentation.
+  if (comments.length === 0) {
+    const previous = anchor.previousNamedSibling;
+    const lastChild = previous?.namedChild(previous.namedChildCount - 1);
+    if (lastChild && lastChild.endPosition.row === anchor.startPosition.row - 1) {
+      for (let i = previous!.namedChildCount - 1; i >= 0; i--) {
+        const child = previous!.namedChild(i);
+        if (child && (child.type === 'lineComment' || child.type === 'blockComment')) {
+          comments.unshift(getNodeText(child, source));
+        } else {
+          break;
+        }
+      }
     }
   }
 

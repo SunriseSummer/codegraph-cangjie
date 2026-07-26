@@ -153,6 +153,348 @@ export function sameLanguageFamily(a: string, b: string): boolean {
   const fa = LANGUAGE_FAMILY[a];
   return fa !== undefined && fa === LANGUAGE_FAMILY[b];
 }
+
+/** Limit Cangjie matches to the caller's package or explicit import surface. */
+function filterCangjiePackageCandidates(
+  candidates: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node[] {
+  if (ref.language !== 'cangjie') return candidates;
+  const from = context.getNodeById?.(ref.fromNodeId);
+  const callerPackage =
+    from?.qualifiedName.split('::')[0] ??
+    context.getNodesInFile(ref.filePath).find((node) => node.kind === 'namespace')?.name;
+  const imports = context
+    .getNodesInFile(ref.filePath)
+    .filter((node) => node.kind === 'import' && node.language === 'cangjie')
+    .map((node) => node.name.replace(/\.\*$/, ''));
+  return candidates.filter((candidate) => {
+    if (candidate.filePath === ref.filePath) return true;
+    const candidatePackage = candidate.qualifiedName.split('::')[0] ?? '';
+    if (!candidatePackage) return false;
+    if (callerPackage && candidatePackage === callerPackage) return true;
+    return imports.some(
+      (imported) =>
+        imported === candidatePackage ||
+        imported.startsWith(`${candidatePackage}.`) ||
+        candidatePackage.startsWith(`${imported}.`)
+    );
+  });
+}
+
+interface CangjieImportBinding {
+  module: string;
+  alias?: string;
+}
+
+const CANGJIE_IMPORT_BINDINGS = new WeakMap<
+  ResolutionContext,
+  Map<string, CangjieImportBinding[]>
+>();
+const CANGJIE_EXPORTED_SYMBOLS = new WeakMap<
+  ResolutionContext,
+  Map<string, Node[]>
+>();
+
+function cangjieImportBindings(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): CangjieImportBinding[] {
+  let byFile = CANGJIE_IMPORT_BINDINGS.get(context);
+  if (!byFile) {
+    byFile = new Map();
+    CANGJIE_IMPORT_BINDINGS.set(context, byFile);
+  }
+  const cached = byFile.get(ref.filePath);
+  if (cached) return cached;
+
+  const bindings: CangjieImportBinding[] = [];
+  const seen = new Set<string>();
+  for (const node of context.getNodesInFile(ref.filePath)) {
+    if (node.kind !== 'import' || node.language !== 'cangjie') continue;
+    const alias = node.signature?.match(/\(as\s+([\p{L}_][\p{L}\p{N}_]*)\)\s*$/u)?.[1];
+    const key = `${node.name}\0${alias ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    bindings.push({ module: node.name, alias });
+  }
+  byFile.set(ref.filePath, bindings);
+  return bindings;
+}
+
+function cangjiePackageName(node: Node): string {
+  return node.qualifiedName.split('::')[0] ?? '';
+}
+
+function cangjieCandidatesForReference(candidates: Node[], ref: UnresolvedRef): Node[] {
+  const visible = candidates.filter((node) => node.language === 'cangjie' && node.isExported);
+  if (ref.referenceKind === 'calls') {
+    return visible.filter((node) =>
+      ['function', 'method', 'field', 'property'].includes(node.kind)
+    );
+  }
+  if (ref.referenceKind === 'instantiates') {
+    return visible.filter((node) => ['class', 'struct', 'enum_member'].includes(node.kind));
+  }
+  if (ref.referenceKind === 'references') {
+    return visible.filter((node) => node.kind !== 'extension');
+  }
+  return visible;
+}
+
+function cangjieExportedCandidates(
+  packageName: string,
+  symbolName: string,
+  context: ResolutionContext,
+  depth = 0,
+  seen = new Set<string>()
+): Node[] {
+  const key = `${packageName}\0${symbolName}`;
+  if (depth > 8 || seen.has(key)) return [];
+  let exportedByName = CANGJIE_EXPORTED_SYMBOLS.get(context);
+  if (!exportedByName) {
+    exportedByName = new Map();
+    CANGJIE_EXPORTED_SYMBOLS.set(context, exportedByName);
+  }
+  if (depth === 0) {
+    const cached = exportedByName.get(key);
+    if (cached) return cached;
+  }
+  seen.add(key);
+
+  const direct = context
+    .getNodesByName(symbolName)
+    .filter(
+      (node) =>
+        node.language === 'cangjie' &&
+        node.kind !== 'import' &&
+        node.isExported &&
+        cangjiePackageName(node) === packageName
+    );
+  if (direct.length > 0) {
+    if (depth === 0) exportedByName.set(key, direct);
+    return direct;
+  }
+
+  const forwarded: Node[] = [];
+  for (const imported of context.getNodesByKind('import')) {
+    if (
+      imported.language !== 'cangjie' ||
+      !imported.isExported ||
+      cangjiePackageName(imported) !== packageName
+    ) {
+      continue;
+    }
+    const module = imported.name.replace(/\.\*$/, '');
+    const alias = imported.signature?.match(/\(as\s+([\p{L}_][\p{L}\p{N}_]*)\)\s*$/u)?.[1];
+    const wildcard = imported.name.endsWith('.*');
+    const dot = module.lastIndexOf('.');
+    const upstreamPackage = wildcard ? module : dot >= 0 ? module.slice(0, dot) : '';
+    const upstreamName = wildcard ? symbolName : dot >= 0 ? module.slice(dot + 1) : module;
+    const locallyExportedName = alias ?? upstreamName;
+    if (!upstreamPackage || locallyExportedName !== symbolName) continue;
+    forwarded.push(
+      ...cangjieExportedCandidates(upstreamPackage, upstreamName, context, depth + 1, new Set(seen))
+    );
+  }
+  const unique = [...new Map(forwarded.map((node) => [node.id, node])).values()];
+  if (depth === 0) exportedByName.set(key, unique);
+  return unique;
+}
+
+function resolveUniqueCangjieImport(candidates: Node[], ref: UnresolvedRef): ResolvedRef | null {
+  const unique = [...new Map(candidates.map((node) => [node.id, node])).values()];
+  if (unique.length !== 1) return null;
+  return {
+    original: ref,
+    targetNodeId: unique[0]!.id,
+    confidence: 0.98,
+    resolvedBy: 'import',
+  };
+}
+
+interface CangjieImportedType {
+  name: string;
+  packageName: string;
+}
+
+function cangjieImportedTypeBinding(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): CangjieImportedType | null {
+  const matches = cangjieImportBindings(ref, context)
+    .filter((binding) => binding.alias === typeName)
+    .flatMap((binding) => {
+      const module = binding.module.replace(/\.\*$/, '');
+      const dot = module.lastIndexOf('.');
+      if (dot < 0) return [];
+      const packageName = module.slice(0, dot);
+      const importedName = module.slice(dot + 1);
+      return cangjieExportedCandidates(packageName, importedName, context)
+        .filter(
+          (node) =>
+            node.language === 'cangjie' &&
+            node.isExported &&
+            ['class', 'struct', 'interface', 'enum'].includes(node.kind) &&
+            cangjiePackageName(node) === packageName
+        )
+        .map((node) => ({
+          name: node.name,
+          packageName: cangjiePackageName(node),
+        }));
+    });
+  const unique = [
+    ...new Map(matches.map((match) => [`${match.packageName}\0${match.name}`, match])).values(),
+  ];
+  return unique.length === 1 ? unique[0]! : null;
+}
+
+function cangjieImportedTypeMembers(
+  importedType: CangjieImportedType,
+  memberName: string,
+  kinds: Node['kind'][],
+  context: ResolutionContext
+): Node[] {
+  const qualifiedName = `${importedType.packageName}::${importedType.name}::${memberName}`;
+  return context
+    .getNodesByName(memberName)
+    .filter(
+      (node) =>
+        node.language === 'cangjie' &&
+        node.isExported &&
+        kinds.includes(node.kind) &&
+        node.qualifiedName === qualifiedName
+    );
+}
+
+/**
+ * Resolve Cangjie symbol aliases (`import a.Widget as W`) and package aliases
+ * (`import a as pkg`). Cangjie imports name packages/symbols rather than files,
+ * so the generic path-based import resolver cannot safely interpret them.
+ */
+export function matchCangjieImportAlias(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'cangjie') return null;
+  if (
+    ref.referenceKind !== 'calls' &&
+    ref.referenceKind !== 'instantiates' &&
+    ref.referenceKind !== 'references'
+  ) {
+    return null;
+  }
+
+  const bindings = cangjieImportBindings(ref, context);
+  if (bindings.length === 0) return null;
+  const separator = ref.referenceName.lastIndexOf('.');
+
+  // A bare local alias imports one concrete symbol.
+  if (separator < 0) {
+    const candidates: Node[] = [];
+    for (const binding of bindings) {
+      const module = binding.module.replace(/\.\*$/, '');
+      if (binding.module.endsWith('.*')) {
+        if (binding.alias) continue;
+        candidates.push(
+          ...cangjieCandidatesForReference(
+            cangjieExportedCandidates(module, ref.referenceName, context),
+            ref
+          )
+        );
+        continue;
+      }
+      const dot = module.lastIndexOf('.');
+      if (dot < 0) continue;
+      const packageName = module.slice(0, dot);
+      const exportedName = module.slice(dot + 1);
+      if (
+        binding.alias !== ref.referenceName &&
+        (binding.alias || exportedName !== ref.referenceName)
+      ) {
+        continue;
+      }
+      candidates.push(
+        ...cangjieCandidatesForReference(
+          cangjieExportedCandidates(packageName, exportedName, context),
+          ref
+        )
+      );
+    }
+    return resolveUniqueCangjieImport(candidates, ref);
+  }
+
+  const qualifier = ref.referenceName.slice(0, separator);
+  const memberName = ref.referenceName.slice(separator + 1);
+  const candidates: Node[] = [];
+  for (const binding of bindings) {
+    const module = binding.module.replace(/\.\*$/, '');
+    const moduleDot = module.lastIndexOf('.');
+    const importedPackage = moduleDot >= 0 ? module.slice(0, moduleDot) : '';
+    const importedName = moduleDot >= 0 ? module.slice(moduleDot + 1) : module;
+
+    if (binding.alias === qualifier && importedPackage) {
+      // The alias may name a concrete imported type (`W.create()`).
+      const importedTypes = cangjieExportedCandidates(
+        importedPackage,
+        importedName,
+        context
+      ).filter(
+        (node) =>
+          node.language === 'cangjie' &&
+          node.isExported &&
+          ['class', 'struct', 'interface', 'enum'].includes(node.kind) &&
+          cangjiePackageName(node) === importedPackage
+      );
+      if (importedTypes.length > 0) {
+        for (const importedType of importedTypes) {
+          const binding = {
+            name: importedType.name,
+            packageName: cangjiePackageName(importedType),
+          };
+          if (ref.referenceKind === 'calls') {
+            candidates.push(
+              ...cangjieImportedTypeMembers(binding, memberName, ['method', 'enum_member'], context)
+            );
+          } else if (ref.referenceKind === 'references') {
+            candidates.push(
+              ...cangjieImportedTypeMembers(
+                binding,
+                memberName,
+                ['field', 'property', 'constant', 'enum_member'],
+                context
+              )
+            );
+          }
+        }
+        continue;
+      }
+    }
+
+    // Otherwise the qualifier names a package, either through an alias or
+    // directly through a wildcard/package import.
+    const packageName =
+      binding.alias === qualifier
+        ? module
+        : qualifier === module
+          ? module
+          : !binding.alias && qualifier === importedName
+            ? module
+            : binding.module.endsWith('.*') && qualifier === module
+              ? module
+              : null;
+    if (!packageName) continue;
+    candidates.push(
+      ...cangjieCandidatesForReference(
+        cangjieExportedCandidates(packageName, memberName, context),
+        ref
+      )
+    );
+  }
+  return resolveUniqueCangjieImport(candidates, ref);
+}
 /**
  * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
  * Languages not listed (php, python, go, ruby, rust, dart, …) and config
@@ -187,7 +529,12 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
-  if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
+  if (
+    ref.referenceKind === 'references' ||
+    ref.referenceKind === 'function_ref' ||
+    (ref.language === 'cangjie' &&
+      (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates'))
+  ) {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
   if (ref.referenceKind === 'imports') {
@@ -392,10 +739,32 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+  let candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context));
+  if (ref.language === 'cangjie') {
+    candidates = filterCangjiePackageCandidates(candidates, ref, context)
+      .filter((node) => node.id !== ref.fromNodeId);
+    if (ref.referenceKind === 'calls') {
+      candidates = candidates.filter(
+        (node) =>
+          node.kind === 'function' ||
+          node.kind === 'method' ||
+          node.kind === 'field' ||
+          node.kind === 'property'
+      );
+    } else if (ref.referenceKind === 'instantiates') {
+      candidates = candidates.filter(
+        (node) =>
+          node.kind === 'class' ||
+          node.kind === 'struct' ||
+          node.kind === 'enum_member'
+      );
+    } else if (ref.referenceKind === 'references') {
+      candidates = candidates.filter((node) => node.kind !== 'extension');
+    }
+  }
 
   if (candidates.length === 0) {
     return null;
@@ -1171,6 +1540,8 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  CANGJIE_IMPORT_BINDINGS.delete(context);
+  CANGJIE_EXPORTED_SYMBOLS.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -1349,6 +1720,227 @@ function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext)
     }
   }
   return start;
+}
+
+/** Tightest Cangjie type-like node enclosing a reference. */
+function enclosingCangjieType(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node | null {
+  let enclosing: Node | null = null;
+  for (const node of context.getNodesInFile(ref.filePath)) {
+    if (
+      node.language !== 'cangjie' ||
+      !['class', 'struct', 'interface', 'enum', 'extension'].includes(node.kind)
+    ) {
+      continue;
+    }
+    const end = node.endLine ?? node.startLine;
+    if (
+      node.startLine <= ref.line &&
+      end >= ref.line &&
+      (!enclosing || node.startLine >= enclosing.startLine)
+    ) {
+      enclosing = node;
+    }
+  }
+  return enclosing;
+}
+
+function normalizeCangjieDeclaredType(raw: string): string | null {
+  let type = raw.trim().replace(/^[?!]+\s*/, '');
+  if (!type || type.startsWith('(')) return null;
+  type = type.replace(/<.*$/s, '').trim();
+  const last = type.split('.').pop()?.trim();
+  return last && /^[\p{L}_][\p{L}\p{N}_]*$/u.test(last) ? last : null;
+}
+
+const CANGJIE_DECLARED_TYPE_PATTERN =
+  '([?!]?(?:[\\p{L}_][\\p{L}\\p{N}_]*\\.)*[\\p{L}_][\\p{L}\\p{N}_]*(?:<[^>\\r\\n]+>)?)';
+
+function cangjieConstructedTypeOnLine(line: string, name: string): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const boundary = `(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`;
+  const declaration = new RegExp(
+    `\\b(?:let|var)\\s+${boundary}(?:\\s*:\\s*${CANGJIE_DECLARED_TYPE_PATTERN})?` +
+      `\\s*=\\s*${CANGJIE_DECLARED_TYPE_PATTERN}\\s*[({]`,
+    'u'
+  );
+  const match = line.match(declaration);
+  return match?.[2] ?? match?.[1] ?? null;
+}
+
+function cangjieTypeFromSignature(signature: string | undefined): string | null {
+  if (!signature) return null;
+  return (
+    signature.match(
+      /:\s*([?!]?(?:[\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*(?:<[^>\r\n]+>)?)/u
+    )?.[1] ?? null
+  );
+}
+
+/** Recover `name: Type` or `let name = Type(...)` within Cangjie scope. */
+function cangjieDeclaredTypeRaw(
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): string | null {
+  const lines =
+    context.getFileLines?.(ref.filePath) ??
+    context.readFile(ref.filePath)?.split(/\r?\n/) ??
+    null;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const boundary = `(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`;
+  const declaration = new RegExp(
+    `${boundary}\\s*:\\s*${CANGJIE_DECLARED_TYPE_PATTERN}`,
+    'u'
+  );
+  if (lines?.length) {
+    const callIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+    const startIndex = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+    for (let index = callIndex; index >= startIndex; index--) {
+      const match = lines[index]?.match(declaration);
+      if (match?.[1]) return match[1];
+      const constructed = lines[index]
+        ? cangjieConstructedTypeOnLine(lines[index]!, name)
+        : null;
+      if (constructed) return constructed;
+    }
+  }
+
+  const enclosing = enclosingCangjieType(ref, context);
+  if (!enclosing) return null;
+  const end = enclosing.endLine ?? enclosing.startLine;
+  const field = context.getNodesInFile(ref.filePath).find(
+    (node) =>
+      ['field', 'constant', 'property'].includes(node.kind) &&
+      node.name === name &&
+      node.startLine >= enclosing.startLine &&
+      (node.endLine ?? node.startLine) <= end
+  );
+  if (!field) return null;
+  const signatureType = cangjieTypeFromSignature(field.signature);
+  if (signatureType) return signatureType;
+  const fieldLine = lines?.[Math.max(0, field.startLine - 1)];
+  return fieldLine ? cangjieConstructedTypeOnLine(fieldLine, name) : null;
+}
+
+function cangjieMembersOnType(
+  typeName: string,
+  memberName: string,
+  kinds: Node['kind'][],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth = 0,
+  seen = new Set<string>()
+): Node[] {
+  if (depth > 4 || seen.has(typeName)) return [];
+  seen.add(typeName);
+  const suffix = `::${typeName}::${memberName}`;
+  const direct = filterCangjiePackageCandidates(
+    context
+      .getNodesByName(memberName)
+      .filter(
+        (node) =>
+          node.language === 'cangjie' &&
+          kinds.includes(node.kind) &&
+          (node.qualifiedName === `${typeName}::${memberName}` ||
+            node.qualifiedName.endsWith(suffix))
+      ),
+    ref,
+    context
+  );
+  if (direct.length > 0) return direct;
+  const inherited = (context.getSupertypes?.(typeName, 'cangjie') ?? []).flatMap(
+    (supertype) =>
+      cangjieMembersOnType(
+        supertype,
+        memberName,
+        kinds,
+        ref,
+        context,
+        depth + 1,
+        seen
+      )
+  );
+  return [...new Map(inherited.map((node) => [node.id, node])).values()];
+}
+
+function chooseUniqueCangjie(
+  candidates: Node[],
+  ref: UnresolvedRef,
+  confidence = 0.9
+): ResolvedRef | null {
+  const preferred = preferCallSiteFile(candidates, ref.filePath);
+  if (preferred.length !== 1) return null;
+  return {
+    original: ref,
+    targetNodeId: preferred[0]!.id,
+    confidence,
+    resolvedBy: 'instance-method',
+  };
+}
+
+/** Resolve a Cangjie data-member read only after proving its receiver type. */
+export function matchCangjieFieldRead(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'cangjie' || ref.referenceKind !== 'references') return null;
+  const match = ref.referenceName.match(
+    /^([\p{L}\p{N}_]+)\.([\p{L}\p{N}_]+)$/u
+  );
+  if (!match) return null;
+  const receiver = match[1]!;
+  const member = match[2]!;
+  let typeName: string | null = null;
+  if (receiver === 'this') {
+    typeName = enclosingCangjieType(ref, context)?.name ?? null;
+  } else {
+    const explicitType = filterCangjiePackageCandidates(
+      context
+        .getNodesByName(receiver)
+        .filter(
+          (node) =>
+            node.language === 'cangjie' &&
+            ['class', 'struct', 'enum'].includes(node.kind)
+        ),
+      ref,
+      context
+    );
+    if (explicitType.length === 1) typeName = receiver;
+    else {
+      const raw = cangjieDeclaredTypeRaw(receiver, ref, context);
+      const declaredType = raw ? normalizeCangjieDeclaredType(raw) : null;
+      const importedType = declaredType
+        ? cangjieImportedTypeBinding(declaredType, ref, context)
+        : null;
+      if (importedType) {
+        return chooseUniqueCangjie(
+          cangjieImportedTypeMembers(
+            importedType,
+            member,
+            ['field', 'property', 'constant', 'enum_member'],
+            context
+          ),
+          ref
+        );
+      }
+      typeName = declaredType;
+    }
+  }
+  if (!typeName) return null;
+  return chooseUniqueCangjie(
+    cangjieMembersOnType(
+      typeName,
+      member,
+      ['field', 'property', 'constant', 'enum_member'],
+      ref,
+      context
+    ),
+    ref,
+    receiver === 'this' ? 0.95 : 0.9
+  );
 }
 
 /**
@@ -1618,6 +2210,11 @@ export function matchMethodCall(
   // every downstream strategy compares the method part by exact string
   // equality, so a stray match can't invent an edge.
   const dotMatch =
+    (ref.language === 'cangjie'
+      ? ref.referenceName.match(
+          /^([\p{L}\p{N}_.\[\]]+)\.([\p{L}\p{N}_]+)$/u
+        )
+      : null) ??
     ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
     (ref.language === 'cpp'
       ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
@@ -1669,6 +2266,71 @@ export function matchMethodCall(
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+
+  // Cangjie is statically typed: bind `this`, named types, and local/field
+  // receivers only after validating that the method belongs to the recovered
+  // type. If no type can be proven, stay unresolved rather than falling
+  // through to the same-name fuzzy heuristics.
+  if (ref.language === 'cangjie' && dotMatch) {
+    if (objectOrClass === 'this') {
+      const owner = enclosingCangjieType(ref, context)?.name;
+      return owner
+        ? chooseUniqueCangjie(
+            cangjieMembersOnType(owner, methodName!, ['method'], ref, context),
+            ref,
+            0.95
+          )
+        : null;
+    }
+
+    const namedTypes = filterCangjiePackageCandidates(
+      context
+        .getNodesByName(objectOrClass!)
+        .filter(
+          (node) =>
+            node.language === 'cangjie' &&
+            ['class', 'struct', 'interface', 'enum'].includes(node.kind)
+        ),
+      ref,
+      context
+    );
+    if (namedTypes.length > 0) {
+      const enumMember = context
+        .getNodesByName(methodName!)
+        .filter(
+          (node) =>
+            node.language === 'cangjie' &&
+            node.kind === 'enum_member' &&
+            node.qualifiedName.endsWith(`::${objectOrClass}::${methodName}`)
+        );
+      if (enumMember.length > 0) {
+        return chooseUniqueCangjie(enumMember, ref);
+      }
+      return chooseUniqueCangjie(
+        cangjieMembersOnType(objectOrClass!, methodName!, ['method'], ref, context),
+        ref
+      );
+    }
+
+    const rawType = cangjieDeclaredTypeRaw(objectOrClass!, ref, context);
+    const declaredType = rawType ? normalizeCangjieDeclaredType(rawType) : null;
+    const importedType = declaredType
+      ? cangjieImportedTypeBinding(declaredType, ref, context)
+      : null;
+    if (importedType) {
+      return chooseUniqueCangjie(
+        cangjieImportedTypeMembers(importedType, methodName!, ['method'], context),
+        ref
+      );
+    }
+    const inferredType = declaredType;
+    return inferredType
+      ? chooseUniqueCangjie(
+          cangjieMembersOnType(inferredType, methodName!, ['method'], ref, context),
+          ref
+        )
+      : null;
+  }
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
@@ -2223,6 +2885,22 @@ export function matchReference(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+
+  const cangjieImport = nmTimed('cangjieImportAlias', ref, () =>
+    matchCangjieImportAlias(ref, context)
+  );
+  if (cangjieImport) return cangjieImport;
+
+  // Dotted Cangjie `references` values are field/property reads. Their
+  // receiver must be statically proven; never let a miss degrade to a fuzzy
+  // same-name edge elsewhere in the project.
+  if (
+    ref.language === 'cangjie' &&
+    ref.referenceKind === 'references' &&
+    ref.referenceName.includes('.')
+  ) {
+    return matchCangjieFieldRead(ref, context);
   }
 
   // ArkTS chained UI attributes — emitted with a leading dot (`.titleStyle`,

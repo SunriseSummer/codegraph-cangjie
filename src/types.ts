@@ -42,6 +42,7 @@ export const NODE_KINDS = [
   'export',
   'route',
   'component',
+  'extension',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -116,6 +117,7 @@ export const LANGUAGES = [
   'vbnet',
   'erlang',
   'terraform',
+  'cangjie',
   'unknown',
 ] as const;
 

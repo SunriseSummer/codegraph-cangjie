@@ -33,12 +33,18 @@ extern "C" {
 extern "C" {
     fn tree_sitter_dart() -> *const ();
 }
+// Vendored Cangjie 1.0.5 grammar. These are the same generated sources used
+// to build src/extraction/wasm/tree-sitter-cangjie.wasm.
+extern "C" {
+    fn tree_sitter_cangjie() -> *const ();
+}
 
 /// Languages this kernel binary can extract (reported by contractInfo;
 /// TS-side routing policy decides what actually routes).
-pub const LANGUAGES: [&str; 20] = [
+pub const LANGUAGES: [&str; 21] = [
     "typescript", "tsx", "javascript", "jsx", "java", "python", "go", "c", "cpp", "rust",
     "csharp", "ruby", "php", "swift", "kotlin", "r", "lua", "luau", "scala", "dart",
+    "cangjie",
 ];
 
 pub fn grammar_for(language: &str) -> Option<Language> {
@@ -92,6 +98,9 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         // (same commit as the byte-copied tree-sitter-wasms 0.1.13 artifact).
         "dart" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_dart) }.into())
+        }
+        "cangjie" => {
+            Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_cangjie) }.into())
         }
         _ => None,
     }

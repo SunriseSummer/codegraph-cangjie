@@ -110,6 +110,10 @@ const DEFAULT_ROUTED: ReadonlySet<Language> = new Set<Language>([
   // --max-deferral 0.3; the RATE, not the count, is the signal (flutter
   // HEAD drifts).
   'dart',
+  // Cangjie 1.0.5: the native and WASM grammars share generated sources;
+  // focused LF/CRLF semantic parity covers declarations, primary constructors,
+  // properties, extensions, inheritance, calls and field reads.
+  'cangjie',
 ]);
 
 /**

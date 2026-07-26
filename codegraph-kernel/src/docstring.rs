@@ -21,7 +21,12 @@ fn is_wrapper(kind: &str) -> bool {
 fn is_comment(kind: &str) -> bool {
     matches!(
         kind,
-        "comment" | "line_comment" | "block_comment" | "documentation_comment"
+        "comment"
+            | "line_comment"
+            | "block_comment"
+            | "documentation_comment"
+            | "lineComment"
+            | "blockComment"
     )
 }
 
@@ -148,6 +153,26 @@ pub fn preceding_docstring(node: Node, src: &str) -> Option<String> {
             sibling = s.prev_named_sibling();
         } else {
             break;
+        }
+    }
+    // Cangjie comment extras may be attached to the preceding declaration.
+    // Mirror the TS helper's adjacency-gated recovery.
+    if comments.is_empty() {
+        if let Some(previous) = anchor.prev_named_sibling() {
+            if let Some(last) = previous.named_child(previous.named_child_count().saturating_sub(1)) {
+                if last.end_position().row + 1 == anchor.start_position().row {
+                    let mut i = previous.named_child_count();
+                    while i > 0 {
+                        i -= 1;
+                        let Some(child) = previous.named_child(i) else { break };
+                        if matches!(child.kind(), "lineComment" | "blockComment") {
+                            comments.push(&src[child.byte_range()]);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     if comments.is_empty() {

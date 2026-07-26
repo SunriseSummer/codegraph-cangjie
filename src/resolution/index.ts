@@ -836,6 +836,23 @@ export class ReferenceResolver {
    * still gets a chance when the name has no project-wide declaration.
    */
   private matchesAnyImport(ref: UnresolvedRef): boolean {
+    if (ref.language === 'cangjie') {
+      const localRoot = ref.referenceName.split('.')[0] ?? ref.referenceName;
+      if (
+        this.context
+          .getNodesInFile(ref.filePath)
+          .some(
+            (node) =>
+              node.kind === 'import' &&
+              node.language === 'cangjie' &&
+              node.signature?.match(
+                /\(as\s+([\p{L}_][\p{L}\p{N}_]*)\)\s*$/u
+              )?.[1] === localRoot
+          )
+      ) {
+        return true;
+      }
+    }
     const imports = this.context.getImportMappings(ref.filePath, ref.language);
     if (imports.length === 0) return false;
     for (const imp of imports) {

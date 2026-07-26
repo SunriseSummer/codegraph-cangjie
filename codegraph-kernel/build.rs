@@ -84,4 +84,18 @@ fn main() {
     dart.flag_if_supported("-utf-8"); // msvc
     dart.compile("tree-sitter-dart");
     println!("cargo:rerun-if-changed=grammars/dart");
+
+    // Cangjie 1.0.5 grammar — generated parser and scanner are vendored from
+    // the companion treesitter-cangjie workspace. The native and WASM paths
+    // therefore expose identical node/field tables.
+    let mut cangjie = cc::Build::new();
+    cangjie.include("grammars/cangjie");
+    cangjie.file("grammars/cangjie/parser.c");
+    cangjie.file("grammars/cangjie/scanner.c");
+    cangjie.flag_if_supported("-Wno-unused-parameter");
+    cangjie.flag_if_supported("-Wno-unused-but-set-variable");
+    cangjie.flag_if_supported("-Wno-unused-function");
+    cangjie.flag_if_supported("-utf-8"); // msvc
+    cangjie.compile("tree-sitter-cangjie");
+    println!("cargo:rerun-if-changed=grammars/cangjie");
 }

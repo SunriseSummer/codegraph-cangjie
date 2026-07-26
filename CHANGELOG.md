@@ -9,6 +9,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Added full Cangjie (`.cj`) support targeting Cangjie 1.0.5: package/import expansion, declarations (including structs, enum constructors, extensions, primary constructors and properties), signatures/generics/visibility, inheritance/conformance, call and field-reference extraction, and receiver-aware reference resolution.
+- Cangjie runs through the native Rust kernel by default with the same generated grammar as the vendored WASM fallback. Native/WASM extraction is byte-identical across all 792 source files in the SDL, PlotMore, CUI and small-project test corpora; syntactically recovered files continue to fall back independently.
+- Added executable Cangjie 1.0.5 project fixtures for language features, import boundaries and concurrency, with compiler self-checks and project-level CodeGraph assertions.
+
+### Fixed
+
+- Made the kernel parity harness load built modules correctly on Windows and added `.cj` routing.
+- Cangjie references now preserve import identity across grouped/direct/wildcard imports, symbol and package aliases, colliding sibling-package names and public re-exports, rather than falling through to an ambiguous same-name match.
+- Optional chaining now emits the same normalized call and field references as ordinary member access in both the native and WASM extractors.
+
+## [1.5.0] - 2026-07-21
+
 # ⚡ The Rust engine release — with near-instant sync
 
 **This release rebuilds CodeGraph's parsing engine as a native Rust kernel, overhauls the resolution pipeline around it, and makes the live graph effectively instant: a save now reaches the graph in well under a second, even on a 27,000-file repository. It is the largest performance upgrade in the project's history — and every graph is verified byte-for-byte identical to the previous engine.**
@@ -707,3 +721,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.3.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.3.1
 [1.4.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.4.0
 [1.4.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.4.1
+[1.5.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.5.0

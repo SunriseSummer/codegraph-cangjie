@@ -25,7 +25,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = (p) => path.join(ROOT, 'dist', p);
@@ -48,7 +48,7 @@ if (paths.length === 0) {
   process.exit(2);
 }
 
-const KERNEL_LANGS = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go', 'c', 'cpp', 'rust', 'csharp', 'ruby', 'php', 'swift', 'kotlin', 'r', 'lua', 'luau', 'scala', 'dart']);
+const KERNEL_LANGS = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go', 'c', 'cpp', 'rust', 'csharp', 'ruby', 'php', 'swift', 'kotlin', 'r', 'lua', 'luau', 'scala', 'dart', 'cangjie']);
 const EXTS = new Map([
   ['.ts', 'typescript'], ['.mts', 'typescript'], ['.cts', 'typescript'],
   ['.tsx', 'tsx'], ['.js', 'javascript'], ['.mjs', 'javascript'],
@@ -68,6 +68,7 @@ const EXTS = new Map([
   ['.lua', 'lua'], ['.luau', 'luau'], // R7b batch 4
   ['.scala', 'scala'], ['.sc', 'scala'], // R7b batch 4
   ['.dart', 'dart'], // R7b batch 4
+  ['.cj', 'cangjie'], // Cangjie 1.0.5
 ]);
 
 /** Collect candidate files. */
@@ -103,9 +104,10 @@ if (files.length === 0) {
 }
 
 // --- load the built engine ---------------------------------------------------
-const { extractFromSource } = await import(dist('extraction/tree-sitter.js'));
-const { initGrammars, loadGrammarsForLanguages, detectLanguage } = await import(dist('extraction/grammars.js'));
-const kernel = await import(dist('extraction/kernel/index.js'));
+const distUrl = (p) => pathToFileURL(dist(p)).href;
+const { extractFromSource } = await import(distUrl('extraction/tree-sitter.js'));
+const { initGrammars, loadGrammarsForLanguages, detectLanguage } = await import(distUrl('extraction/grammars.js'));
+const kernel = await import(distUrl('extraction/kernel/index.js'));
 
 await initGrammars();
 await loadGrammarsForLanguages([...KERNEL_LANGS]);
