@@ -67,7 +67,7 @@ describe('detectInstallMethod', () => {
   });
 
   it('detects a global npm install', () => {
-    const filename = '/usr/local/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js';
+    const filename = '/usr/local/lib/node_modules/@cangjie-lang/codegraph/dist/bin/codegraph.js';
     const m = detectInstallMethod({
       filename,
       platform: 'linux',
@@ -79,13 +79,13 @@ describe('detectInstallMethod', () => {
 
   it('detects a local (project) npm install as local', () => {
     const cwd = '/home/u/project';
-    const filename = `${cwd}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`;
+    const filename = `${cwd}/node_modules/@cangjie-lang/codegraph/dist/bin/codegraph.js`;
     const m = detectInstallMethod({ filename, platform: 'linux', cwd, exists: () => false });
     expect(m).toEqual({ kind: 'npm', scope: 'local' });
   });
 
   it('detects an npx run from the _npx cache', () => {
-    const filename = '/home/u/.npm/_npx/abc123/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js';
+    const filename = '/home/u/.npm/_npx/abc123/node_modules/@cangjie-lang/codegraph/dist/bin/codegraph.js';
     const m = detectInstallMethod({ filename, platform: 'linux', cwd: '/home/u', exists: () => false });
     expect(m).toEqual({ kind: 'npx' });
   });
@@ -96,7 +96,7 @@ describe('detectInstallMethod', () => {
   // install.sh into ~/.codegraph — a second install that loses the PATH race
   // to npm's shim, so `codegraph -v` stays on the old version forever.
   it('detects the npm thin-installer platform package as npm, not bundle', () => {
-    const root = '/usr/local/lib/node_modules/@colbymchenry/codegraph/node_modules/@colbymchenry/codegraph-linux-x64';
+    const root = '/usr/local/lib/node_modules/@cangjie-lang/codegraph/node_modules/@cangjie-lang/codegraph-linux-x64';
     const filename = `${root}/lib/dist/bin/codegraph.js`;
     const present = new Set([`${root}/node`, `${root}/bin/codegraph`]);
     const m = detectInstallMethod({
@@ -110,7 +110,7 @@ describe('detectInstallMethod', () => {
 
   it('detects a project-local thin-installer platform package as npm local', () => {
     const cwd = '/home/u/project';
-    const root = `${cwd}/node_modules/@colbymchenry/codegraph/node_modules/@colbymchenry/codegraph-darwin-arm64`;
+    const root = `${cwd}/node_modules/@cangjie-lang/codegraph/node_modules/@cangjie-lang/codegraph-darwin-arm64`;
     const filename = `${root}/lib/dist/bin/codegraph.js`;
     const present = new Set([`${root}/node`, `${root}/bin/codegraph`]);
     const m = detectInstallMethod({ filename, platform: 'darwin', cwd, exists: bundleExists(present) });
@@ -118,7 +118,7 @@ describe('detectInstallMethod', () => {
   });
 
   it('still detects an npx run when the cached platform package has the bundle layout', () => {
-    const root = '/home/u/.npm/_npx/abc123/node_modules/@colbymchenry/codegraph/node_modules/@colbymchenry/codegraph-linux-x64';
+    const root = '/home/u/.npm/_npx/abc123/node_modules/@cangjie-lang/codegraph/node_modules/@cangjie-lang/codegraph-linux-x64';
     const filename = `${root}/lib/dist/bin/codegraph.js`;
     const present = new Set([`${root}/node`, `${root}/bin/codegraph`]);
     const m = detectInstallMethod({ filename, platform: 'linux', cwd: '/home/u', exists: bundleExists(present) });
@@ -182,6 +182,20 @@ describe('version helpers', () => {
     expect(compareVersions('1.0.0-rc.1', '1.0.0')).toBeLessThan(0);
   });
 
+  it('orders Cangjie adaptation and bugfix identifiers numerically', () => {
+    const first = '1.5.0-cangjie-1.0.5.1';
+    expect(parseSemver(first)).toEqual({
+      major: 1,
+      minor: 5,
+      patch: 0,
+      pre: 'cangjie-1.0.5.1',
+    });
+    expect(compareVersions('1.5.0-cangjie-1.0.5.2', first)).toBeGreaterThan(0);
+    expect(compareVersions('1.5.0-cangjie-1.0.5.10', '1.5.0-cangjie-1.0.5.2')).toBeGreaterThan(0);
+    expect(compareVersions('1.5.0-cangjie-1.0.6.1', '1.5.0-cangjie-1.0.5.10')).toBeGreaterThan(0);
+    expect(compareVersions('1.5.1-cangjie-1.0.5.1', '1.5.0-cangjie-1.0.6.1')).toBeGreaterThan(0);
+  });
+
   it('isUpdateAvailable compares, and falls back to string-inequality for unparseable', () => {
     expect(isUpdateAvailable('0.9.8', '0.9.9')).toBe(true);
     expect(isUpdateAvailable('0.9.9', '0.9.9')).toBe(false);
@@ -198,7 +212,7 @@ describe('version helpers', () => {
   });
 
   it('parseLatestTagFromLocation extracts the tag from a releases redirect', () => {
-    expect(parseLatestTagFromLocation('https://github.com/colbymchenry/codegraph/releases/tag/v0.9.9')).toBe('v0.9.9');
+    expect(parseLatestTagFromLocation('https://github.com/SunriseSummer/codegraph-cangjie/releases/tag/v0.9.9')).toBe('v0.9.9');
     expect(parseLatestTagFromLocation('https://github.com/o/r/releases/tag/v1.2.3?foo=bar')).toBe('v1.2.3');
     expect(parseLatestTagFromLocation(undefined)).toBeNull();
     expect(parseLatestTagFromLocation('https://github.com/o/r/releases')).toBeNull();

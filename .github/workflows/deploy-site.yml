@@ -2,7 +2,7 @@ name: Deploy site to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, cangjie-1.0.5]
     paths:
       - 'site/**'
       - '.github/workflows/deploy-site.yml'

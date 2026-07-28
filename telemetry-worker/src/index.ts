@@ -23,9 +23,9 @@ const LABEL_RE = /^[A-Za-z0-9_.:+/ @()-]+$/;
 const INFO_TEXT = `codegraph anonymous-telemetry ingest.
 
 What gets collected (and what never does) is documented field-by-field:
-https://github.com/colbymchenry/codegraph/blob/main/docs/design/telemetry.md
+https://github.com/SunriseSummer/codegraph-cangjie/blob/main/docs/design/telemetry.md
 This endpoint's full source:
-https://github.com/colbymchenry/codegraph/tree/main/telemetry-worker
+https://github.com/SunriseSummer/codegraph-cangjie/tree/main/telemetry-worker
 
 Disable any time: codegraph telemetry off  |  CODEGRAPH_TELEMETRY=0  |  DO_NOT_TRACK=1
 `;

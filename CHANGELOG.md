@@ -1,13 +1,16 @@
 # Changelog
 
 All notable changes to CodeGraph are documented here. Each entry also ships as
-a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
+a [GitHub Release](https://github.com/SunriseSummer/codegraph-cangjie/releases) tagged
 `vX.Y.Z`, which is where most people will look.
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+
+## [1.5.0-cangjie-1.0.5.1] - 2026-07-28
 
 ### New Features
 
@@ -722,3 +725,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.4.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.4.0
 [1.4.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.4.1
 [1.5.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.5.0
+[1.5.0-cangjie-1.0.5.1]: https://github.com/SunriseSummer/codegraph-cangjie/releases/tag/v1.5.0-cangjie-1.0.5.1

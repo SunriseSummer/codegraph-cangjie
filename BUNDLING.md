@@ -46,9 +46,9 @@ linux/amd64`).
    Releases, symlinks `codegraph` onto PATH. Re-run to upgrade; `--uninstall` to
    remove.
 2. **npm** ([`scripts/npm-shim.js`](scripts/npm-shim.js)) — preserves
-   `npm i -g @colbymchenry/codegraph`. The main package is a tiny shim; the
+   `npm i -g @cangjie-lang/codegraph`. The main package is a tiny shim; the
    bundles ship as per-platform `optionalDependencies`
-   (`@colbymchenry/codegraph-<target>` with `os`/`cpu`), so npm installs only the
+   (`@cangjie-lang/codegraph-<target>` with `os`/`cpu`), so npm installs only the
    matching one. The shim — run by the user's Node — execs the bundle, so the
    real work runs on the bundled Node 24. Works even on old Node. On Windows it
    invokes the bundled `node.exe` against the app entry directly (not the `.cmd`
@@ -60,9 +60,11 @@ linux/amd64`).
 ## Release pipeline
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) — manually
-triggered. Reads the version from `package.json`, builds every platform bundle on
-one runner, creates the GitHub Release (notes from `CHANGELOG.md`), and publishes
-the npm shim + per-platform packages. Requires the `NPM_TOKEN` repo secret.
+triggered. Reads and validates the pre-committed version metadata, builds every
+platform bundle, creates the GitHub Release (notes from `CHANGELOG.md`), and
+publishes the npm shim + per-platform packages. The first publication uses
+`NPM_TOKEN_BOOTSTRAP`; later releases use npm OIDC trusted publishing after all
+seven packages have a trusted publisher configured.
 
 Still TODO:
 - **Code signing** — the main gap for "download & run": macOS Gatekeeper needs a

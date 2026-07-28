@@ -8,10 +8,10 @@ import GraphDiagram from '../components/GraphDiagram.astro';
 import { getStarsLabel } from '../lib/github';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
-const repo = 'https://github.com/colbymchenry/codegraph';
-const npm = 'https://www.npmjs.com/package/@colbymchenry/codegraph';
+const repo = 'https://github.com/SunriseSummer/codegraph-cangjie';
+const npm = 'https://www.npmjs.com/package/@cangjie-lang/codegraph';
 const stars = await getStarsLabel();
-const install = 'npx @colbymchenry/codegraph';
+const install = 'npx @cangjie-lang/codegraph';
 ---
 
 <!doctype html>

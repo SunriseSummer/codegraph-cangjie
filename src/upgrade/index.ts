@@ -8,7 +8,7 @@
  *     canonical installer script (single source of truth) so the download /
  *     version-resolution / PATH logic never drifts between first-install and
  *     upgrade.
- *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`. Upgrading
+ *   - **npm** — installed via `npm i -g @cangjie-lang/codegraph`. Upgrading
  *     shells out to npm.
  *   - **npx** — ephemeral; nothing to upgrade (next `npx` fetches latest).
  *   - **source** — a git checkout running its own `dist/`; `git pull` + rebuild.
@@ -30,9 +30,10 @@ import * as https from 'https';
 import { spawnSync } from 'child_process';
 import { ansiColorsEnabled } from '../ui/color';
 
-export const REPO = 'colbymchenry/codegraph';
-export const NPM_PACKAGE = '@colbymchenry/codegraph';
-const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
+export const REPO = 'SunriseSummer/codegraph-cangjie';
+export const NPM_PACKAGE = '@cangjie-lang/codegraph';
+const RELEASE_BRANCH = 'cangjie-1.0.5';
+const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/${RELEASE_BRANCH}`;
 export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
 
 // ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   const norm = toPosix(input.filename);
 
   // Path-based checks come FIRST. The npm thin-installer's per-platform
-  // package (@colbymchenry/codegraph-<platform>-<arch>) is itself a complete
+  // package (@cangjie-lang/codegraph-<platform>-<arch>) is itself a complete
   // bundle — vendored node + bin/ launcher — living inside node_modules, so
   // the layout sniff below would misread every npm install as a standalone
   // bundle. `upgrade` would then curl install.sh into ~/.codegraph: a SECOND
@@ -112,7 +113,7 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   // self-inflicted). A path under node_modules is authoritative about HOW the
   // user installed, whatever the artifact inside looks like.
 
-  // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
+  // npx cache: <…>/_npx/<hash>/node_modules/@cangjie-lang/codegraph/…
   // (checked before npm — the npx cache path also contains /node_modules/).
   if (norm.includes('/_npx/')) {
     return { kind: 'npx' };
@@ -155,7 +156,7 @@ export interface Semver {
 }
 
 export function parseSemver(version: string): Semver | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(version.trim());
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version.trim());
   if (!m) return null;
   return {
     major: parseInt(m[1]!, 10),
@@ -176,7 +177,26 @@ export function compareVersions(a: string, b: string): number {
   // A prerelease is "less than" its release (1.0.0-rc < 1.0.0).
   if (sa.pre && !sb.pre) return -1;
   if (!sa.pre && sb.pre) return 1;
-  if (sa.pre && sb.pre) return sa.pre < sb.pre ? -1 : sa.pre > sb.pre ? 1 : 0;
+  if (sa.pre && sb.pre) {
+    const aIds = sa.pre.split('.');
+    const bIds = sb.pre.split('.');
+    const length = Math.max(aIds.length, bIds.length);
+    for (let i = 0; i < length; i++) {
+      const aId = aIds[i];
+      const bId = bIds[i];
+      if (aId === undefined) return -1;
+      if (bId === undefined) return 1;
+      if (aId === bId) continue;
+      const aNumeric = /^\d+$/.test(aId);
+      const bNumeric = /^\d+$/.test(bId);
+      if (aNumeric && bNumeric) {
+        if (aId.length !== bId.length) return aId.length - bId.length;
+        return aId < bId ? -1 : 1;
+      }
+      if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+      return aId < bId ? -1 : 1;
+    }
+  }
   return 0;
 }
 

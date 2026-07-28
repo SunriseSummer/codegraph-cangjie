@@ -120,9 +120,8 @@ function writeUpdateCheckCache(dir: string, cache: UpdateCheckCacheFile): void {
  * initialize instructions — agent-visible, system-prompt-adjacent text — and
  * the `latest` value arrives from a network redirect via an on-disk cache, so
  * only a reconstructed canonical string may ever be interpolated, never the
- * raw value. (`parseSemver`'s regex is not end-anchored: a value like
- * `1.2.3-x <arbitrary text>` parses "valid" while the raw string would carry
- * the trailing text straight into every session's instructions.)
+ * raw value. `parseSemver` validates the complete input, so trailing text is
+ * rejected; rebuilding the tag here remains a defense in depth boundary.
  */
 export function canonicalVersionTag(v: string): string | null {
   const s = parseSemver(v);

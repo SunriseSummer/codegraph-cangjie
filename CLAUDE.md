@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CodeGraph is a local-first code intelligence library + CLI + MCP server. It parses any supported codebase with tree-sitter, stores symbols/edges/files in SQLite (FTS5), and exposes a knowledge graph to AI agents (Claude Code, Cursor, Codex CLI, opencode) over MCP. Per-project data lives in `.codegraph/`. Extraction is deterministic — derived from AST, not LLM-summarized.
 
-Distributed as `@colbymchenry/codegraph` on npm; same binary serves as installer, indexer, and MCP server.
+Distributed as `@cangjie-lang/codegraph` on npm; same binary serves as installer, indexer, and MCP server.
 
 ## Build, Test, Run
 
@@ -71,7 +71,7 @@ Defined in `src/types.ts`. Both extractors and resolvers must use these exact st
 
 ### Multi-agent installer
 
-`src/installer/` is the entry point for `codegraph install` (and the bare `codegraph`/`npx @colbymchenry/codegraph` invocation). Architecture:
+`src/installer/` is the entry point for `codegraph install` (and the bare `codegraph`/`npx @cangjie-lang/codegraph` invocation). Architecture:
 
 - `targets/registry.ts` lists every supported agent.
 - `targets/types.ts` defines the `AgentTarget` interface — adding a 5th agent (Continue, Zed, Windsurf…) is **one new file in `targets/` + one entry in `registry.ts`**. Each target owns its config-file location and MCP-server JSON/TOML/JSONC writing. (Targets no longer write an instructions file — see below.)
@@ -202,11 +202,11 @@ For any Windows-specific PR, bug, or implementation, validate it on the real Win
 
 ## Releases
 
-Released to npm and mirrored as [GitHub Releases](https://github.com/colbymchenry/codegraph/releases). `CHANGELOG.md` is the source of truth; GitHub Release notes are extracted from it.
+Released to npm and mirrored as [GitHub Releases](https://github.com/SunriseSummer/codegraph-cangjie/releases). `CHANGELOG.md` is the source of truth; GitHub Release notes are extracted from it.
 
 ### Writing changelog entries
 
-**Default: write entries under `## [Unreleased]`** — that's the section reserved for work landing between releases. **Don't pre-create a `## [X.Y.Z]` block** for the next release: the Release workflow's first step is `scripts/prepare-release.mjs`, which automatically promotes everything under `[Unreleased]` into a new `## [X.Y.Z] - <YYYY-MM-DD>` block at release time (or merges into a pre-existing `[X.Y.Z]` block if one exists — but you don't need one). Pre-staging is what caused the v0.9.5 sparse-release-notes incident: a sparse `[0.9.5]` block hand-added before the rest of the work landed got picked by the extractor over the much-larger `[Unreleased]` section above it. Don't do that.
+**Default: write entries under `## [Unreleased]`** — that's the section reserved for work landing between releases. Before triggering a release, run `node scripts/prepare-release.mjs <version>` locally and commit the resulting version block. The Release workflow is read-only with respect to source files: it verifies the version block and lock-file version, but never edits or pushes them.
 
 Formatting rules for any entry (anywhere — `[Unreleased]` or otherwise):
 
@@ -216,16 +216,14 @@ Formatting rules for any entry (anywhere — `[Unreleased]` or otherwise):
 4. Issue / PR references in entries are by number (`(#403)` etc.); the GitHub renderer auto-links them in the published release notes.
 5. **Don't add a `[X.Y.Z]: https://...` link reference yourself** — `prepare-release.mjs` appends it automatically when it promotes the version (idempotent: a re-run is a no-op if it already exists).
 
-Multi-word headings like `### New Features` are safe on the normal release path: `prepare-release.mjs` **Case A** moves the whole `[Unreleased]` body verbatim into `[X.Y.Z]`. (Only its rarely-used **Case B** *merge* splits sub-sections with a single-word `^### (\w+)$` regex that wouldn't match them — and Case B fires only if a `[X.Y.Z]` block was pre-created, which rule above already forbids.)
+Multi-word headings like `### New Features` are safe on the normal release path: `prepare-release.mjs` **Case A** moves the whole `[Unreleased]` body verbatim into `[X.Y.Z]`. Run that preparation locally, review it, and commit it before triggering Actions.
 
 ### Release flow (the user runs these)
 
 Releases are built and published by the **GitHub Actions "Release" workflow**
-(`.github/workflows/release.yml`). It runs `scripts/prepare-release.mjs` to
-promote `[Unreleased]` into `[<version>]` (and auto-commit + push that
-CHANGELOG change back to `main` so on-disk truth matches the published
-notes), then bundles a Node runtime per platform (`scripts/build-bundle.sh`)
-and publishes both the GitHub Release and the npm thin-installer
+(`.github/workflows/release.yml`). It validates pre-committed release metadata,
+then bundles a Node runtime per platform (`scripts/build-bundle.sh`) and
+publishes both the GitHub Release and the npm thin-installer
 (`scripts/pack-npm.sh`: a shim package + per-platform packages).
 Publishing manually is **wrong** now — a plain `npm publish` ships the root
 package (non-bundled), which breaks anyone on Node < 22.5.
@@ -235,23 +233,20 @@ typically does it themselves — often by editing `package.json` directly via
 the GitHub web UI. Don't proactively commit a version bump as part of
 unrelated work, and don't propose one when summarizing a PR.
 
-When the maintainer DOES bump the version, the only edit strictly required is
-to `package.json` — the workflow's "Sync package-lock.json" step detects a
-mismatch between `package.json` and `package-lock.json`, runs
-`npm install --package-lock-only --ignore-scripts` to rewrite the lock file's
-version fields (top-level + `packages.""`), and auto-commits + pushes the
-result back to `main` with `[skip ci]`. So a GitHub-web-UI single-file edit to
-`package.json` is enough to kick off a clean release. (If they edit both files
-locally, that's fine too — the sync step no-ops.)
+When the maintainer DOES bump the version, update `package.json`, run
+`npm install --package-lock-only --ignore-scripts`, run
+`node scripts/prepare-release.mjs <version>`, review the resulting CHANGELOG,
+and commit all three files. The workflow fails rather than rewriting source
+when either the lock file or changelog is not ready.
 
-Once `package.json` is at the target version on `main`, trigger
-**Actions → Release → Run workflow** (on `main`). The workflow:
+Once the release metadata is committed, trigger
+**Actions → Release → Run workflow** on the intended release branch. The workflow:
 
-1. Syncs `package-lock.json` to `package.json`'s version if they've drifted; commits + pushes that change.
-2. Runs `prepare-release.mjs <X.Y.Z>` → promotes `[Unreleased]` → `[X.Y.Z] - <today>` in `CHANGELOG.md`, appends the link reference, commits + pushes the move with `[skip ci]`.
-3. Builds every platform bundle on one runner, generates `SHA256SUMS`.
-4. Creates the GitHub Release with notes from the freshly-promoted `[X.Y.Z]` block.
-5. Publishes the npm shim + per-platform packages. Requires the `NPM_TOKEN` repo secret.
+1. Verifies `package.json`, `package-lock.json`, and CHANGELOG agree.
+2. Builds all six native kernels and platform bundles, then generates `SHA256SUMS`.
+3. Creates the GitHub Release from the committed version block.
+4. Generates, validates, and dry-runs all seven npm packages.
+5. Publishes platform packages first and the main shim last. The first release uses `NPM_TOKEN_BOOTSTRAP`; after trusted publishers are configured and that secret is removed, subsequent releases use OIDC.
 
 **Do not run `npm publish`, `git push`, or `git tag` yourself** — these are
 publish actions on shared state. Write the files, hand the user the commands.
