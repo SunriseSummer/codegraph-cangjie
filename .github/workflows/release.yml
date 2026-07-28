@@ -58,7 +58,7 @@ jobs:
             bash scripts/build-kernel.sh --target "$t"
           done
           ls -R codegraph-kernel/prebuilds
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kernel-${{ matrix.runner }}
           path: codegraph-kernel/prebuilds/
@@ -109,7 +109,7 @@ jobs:
       - name: Download kernel prebuilds
         # All legs are required (see the kernel job), so every target's
         # <target>/codegraph-kernel.node must be present in release/kernel/.
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: kernel-*
           merge-multiple: true
