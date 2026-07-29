@@ -1,4 +1,4 @@
-# CodeGraph with Cangjie
+# CodeGraph + Cangjie Support
 
 本项目在 CodeGraph 上扩展支持仓颉编程语言，可用于中大型仓颉项目的 AI Coding 提效，CodeGraph 项目介绍和使用指南请参阅官方文档：
 
