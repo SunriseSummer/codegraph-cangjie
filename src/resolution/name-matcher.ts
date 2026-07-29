@@ -155,21 +155,57 @@ export function sameLanguageFamily(a: string, b: string): boolean {
 }
 
 /** Limit Cangjie matches to the caller's package or explicit import surface. */
+function cangjieCallerPackage(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): string {
+  const from = context.getNodeById?.(ref.fromNodeId);
+  return (
+    from?.qualifiedName.split('::')[0] ??
+    context
+      .getNodesInFile(ref.filePath)
+      .find((node) => node.kind === 'namespace')?.name ??
+    ''
+  );
+}
+
+function cangjieVisibilityAllows(
+  candidate: Node,
+  callerPackage: string,
+  ref: UnresolvedRef
+): boolean {
+  if (candidate.filePath === ref.filePath || candidate.isExported) return true;
+  const candidatePackage = cangjiePackageName(candidate);
+  switch (candidate.visibility) {
+    case 'private':
+      return false;
+    case 'protected':
+      return (
+        !!candidatePackage &&
+        candidatePackage.split('.')[0] === callerPackage.split('.')[0]
+      );
+    case 'internal':
+    default:
+      return (
+        callerPackage === candidatePackage ||
+        callerPackage.startsWith(`${candidatePackage}.`)
+      );
+  }
+}
+
 function filterCangjiePackageCandidates(
   candidates: Node[],
   ref: UnresolvedRef,
   context: ResolutionContext
 ): Node[] {
   if (ref.language !== 'cangjie') return candidates;
-  const from = context.getNodeById?.(ref.fromNodeId);
-  const callerPackage =
-    from?.qualifiedName.split('::')[0] ??
-    context.getNodesInFile(ref.filePath).find((node) => node.kind === 'namespace')?.name;
+  const callerPackage = cangjieCallerPackage(ref, context);
   const imports = context
     .getNodesInFile(ref.filePath)
     .filter((node) => node.kind === 'import' && node.language === 'cangjie')
     .map((node) => node.name.replace(/\.\*$/, ''));
   return candidates.filter((candidate) => {
+    if (!cangjieVisibilityAllows(candidate, callerPackage, ref)) return false;
     if (candidate.filePath === ref.filePath) return true;
     const candidatePackage = candidate.qualifiedName.split('::')[0] ?? '';
     if (!candidatePackage) return false;
@@ -228,10 +264,18 @@ function cangjiePackageName(node: Node): string {
 }
 
 function cangjieCandidatesForReference(candidates: Node[], ref: UnresolvedRef): Node[] {
-  const visible = candidates.filter((node) => node.language === 'cangjie' && node.isExported);
+  const visible = candidates.filter((node) => node.language === 'cangjie');
   if (ref.referenceKind === 'calls') {
     return visible.filter((node) =>
-      ['function', 'method', 'field', 'property'].includes(node.kind)
+      [
+        'function',
+        'method',
+        'field',
+        'property',
+        'class',
+        'struct',
+        'enum_member',
+      ].includes(node.kind)
     );
   }
   if (ref.referenceKind === 'instantiates') {
@@ -303,6 +347,28 @@ function cangjieExportedCandidates(
   return unique;
 }
 
+function cangjieVisibleCandidates(
+  packageName: string,
+  symbolName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node[] {
+  const callerPackage = cangjieCallerPackage(ref, context);
+  const direct = context
+    .getNodesByName(symbolName)
+    .filter(
+      (node) =>
+        node.language === 'cangjie' &&
+        node.kind !== 'import' &&
+        node.kind !== 'extension' &&
+        cangjiePackageName(node) === packageName &&
+        cangjieVisibilityAllows(node, callerPackage, ref)
+    );
+  return direct.length > 0
+    ? direct
+    : cangjieExportedCandidates(packageName, symbolName, context);
+}
+
 function resolveUniqueCangjieImport(candidates: Node[], ref: UnresolvedRef): ResolvedRef | null {
   const unique = [...new Map(candidates.map((node) => [node.id, node])).values()];
   if (unique.length !== 1) return null;
@@ -325,20 +391,23 @@ function cangjieImportedTypeBinding(
   context: ResolutionContext
 ): CangjieImportedType | null {
   const matches = cangjieImportBindings(ref, context)
-    .filter((binding) => binding.alias === typeName)
+    .filter((binding) => {
+      if (binding.module.endsWith('.*')) return false;
+      const module = binding.module.replace(/\.\*$/, '');
+      const importedName = module.slice(module.lastIndexOf('.') + 1);
+      return binding.alias === typeName || (!binding.alias && importedName === typeName);
+    })
     .flatMap((binding) => {
       const module = binding.module.replace(/\.\*$/, '');
       const dot = module.lastIndexOf('.');
       if (dot < 0) return [];
       const packageName = module.slice(0, dot);
       const importedName = module.slice(dot + 1);
-      return cangjieExportedCandidates(packageName, importedName, context)
+      return cangjieVisibleCandidates(packageName, importedName, ref, context)
         .filter(
           (node) =>
             node.language === 'cangjie' &&
-            node.isExported &&
-            ['class', 'struct', 'interface', 'enum'].includes(node.kind) &&
-            cangjiePackageName(node) === packageName
+            ['class', 'struct', 'interface', 'enum'].includes(node.kind)
         )
         .map((node) => ({
           name: node.name,
@@ -382,9 +451,26 @@ export function matchCangjieImportAlias(
   if (
     ref.referenceKind !== 'calls' &&
     ref.referenceKind !== 'instantiates' &&
-    ref.referenceKind !== 'references'
+    ref.referenceKind !== 'references' &&
+    ref.referenceKind !== 'imports'
   ) {
     return null;
+  }
+
+  if (ref.referenceKind === 'imports') {
+    const module = ref.referenceName.replace(/\.\*$/, '');
+    if (ref.referenceName.endsWith('.*')) return null;
+    const dot = module.lastIndexOf('.');
+    if (dot <= 0) return null;
+    return resolveUniqueCangjieImport(
+      cangjieVisibleCandidates(
+        module.slice(0, dot),
+        module.slice(dot + 1),
+        ref,
+        context
+      ),
+      ref
+    );
   }
 
   const bindings = cangjieImportBindings(ref, context);
@@ -400,7 +486,12 @@ export function matchCangjieImportAlias(
         if (binding.alias) continue;
         candidates.push(
           ...cangjieCandidatesForReference(
-            cangjieExportedCandidates(module, ref.referenceName, context),
+            cangjieVisibleCandidates(
+              module,
+              ref.referenceName,
+              ref,
+              context
+            ),
             ref
           )
         );
@@ -418,7 +509,12 @@ export function matchCangjieImportAlias(
       }
       candidates.push(
         ...cangjieCandidatesForReference(
-          cangjieExportedCandidates(packageName, exportedName, context),
+          cangjieVisibleCandidates(
+            packageName,
+            exportedName,
+            ref,
+            context
+          ),
           ref
         )
       );
@@ -435,18 +531,22 @@ export function matchCangjieImportAlias(
     const importedPackage = moduleDot >= 0 ? module.slice(0, moduleDot) : '';
     const importedName = moduleDot >= 0 ? module.slice(moduleDot + 1) : module;
 
-    if (binding.alias === qualifier && importedPackage) {
-      // The alias may name a concrete imported type (`W.create()`).
-      const importedTypes = cangjieExportedCandidates(
+    if (
+      importedPackage &&
+      (binding.alias === qualifier ||
+        (!binding.alias && importedName === qualifier))
+    ) {
+      // An alias or an ordinary concrete-symbol import may name a type
+      // (`W.create()` / `Widget.create()`).
+      const importedTypes = cangjieVisibleCandidates(
         importedPackage,
         importedName,
+        ref,
         context
       ).filter(
         (node) =>
           node.language === 'cangjie' &&
-          node.isExported &&
-          ['class', 'struct', 'interface', 'enum'].includes(node.kind) &&
-          cangjiePackageName(node) === importedPackage
+          ['class', 'struct', 'interface', 'enum'].includes(node.kind)
       );
       if (importedTypes.length > 0) {
         for (const importedType of importedTypes) {
@@ -488,7 +588,7 @@ export function matchCangjieImportAlias(
     if (!packageName) continue;
     candidates.push(
       ...cangjieCandidatesForReference(
-        cangjieExportedCandidates(packageName, memberName, context),
+        cangjieVisibleCandidates(packageName, memberName, ref, context),
         ref
       )
     );
@@ -743,17 +843,91 @@ export function matchByExactName(
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context));
+  let cangjieCallWasShaped = false;
   if (ref.language === 'cangjie') {
     candidates = filterCangjiePackageCandidates(candidates, ref, context)
       .filter((node) => node.id !== ref.fromNodeId);
+    // A declaration in the current file shadows same-named package/import
+    // candidates. Apply this before overload shaping so an implicit
+    // zero-argument constructor (whose class node has no parameter signature)
+    // is not discarded merely because an imported class shares its name.
+    const sameFile = candidates.filter(
+      (candidate) => candidate.filePath === ref.filePath
+    );
+    if (sameFile.length > 0) candidates = sameFile;
     if (ref.referenceKind === 'calls') {
+      if (!ref.referenceName.includes('.')) {
+        const receiverType = cangjieExpressionTypeRaw(
+          ref.referenceName,
+          ref,
+          context
+        );
+        if (receiverType) {
+          const callable = chooseUniqueCangjie(
+            cangjieMemberCandidatesOnRawType(
+              receiverType,
+              'operator()',
+              ['method'],
+              ref,
+              context
+            ),
+            ref,
+            0.95,
+            context
+          );
+          if (callable) return callable;
+        }
+      }
       candidates = candidates.filter(
         (node) =>
           node.kind === 'function' ||
           node.kind === 'method' ||
           node.kind === 'field' ||
-          node.kind === 'property'
+          node.kind === 'property' ||
+          node.kind === 'class' ||
+          node.kind === 'struct' ||
+          node.kind === 'enum_member'
       );
+
+      // A bare Cangjie call has lexical meaning: at package/function scope it
+      // can only name a top-level function. Methods require an explicit
+      // receiver unless the call appears inside the owning type, where an
+      // implicit `this` is legal. Letting every same-named method participate
+      // here made line proximity choose `GuardedCounter::addMany` for a
+      // top-level `addMany(...)` call in the same file.
+      if (!ref.referenceName.includes('.')) {
+        const constructors = candidates.filter((node) =>
+          ['class', 'struct', 'enum_member'].includes(node.kind)
+        );
+        const owner = enclosingCangjieType(ref, context);
+        if (!owner) {
+          candidates = [
+            ...constructors,
+            ...candidates.filter((node) => node.kind === 'function'),
+          ];
+        } else {
+          const memberIds = new Set(
+            cangjieMembersOnType(
+              owner.name,
+              ref.referenceName,
+              ['method', 'field', 'property'],
+              ref,
+              context
+            ).map((node) => node.id)
+          );
+          const ownedMembers = candidates.filter((node) => memberIds.has(node.id));
+          candidates =
+            ownedMembers.length > 0
+              ? [...constructors, ...ownedMembers]
+              : [
+                  ...constructors,
+                  ...candidates.filter((node) => node.kind === 'function'),
+                ];
+        }
+      }
+      const narrowed = narrowCangjieCallCandidates(candidates, ref, context);
+      candidates = narrowed.candidates;
+      cangjieCallWasShaped = narrowed.shaped;
     } else if (ref.referenceKind === 'instantiates') {
       candidates = candidates.filter(
         (node) =>
@@ -764,6 +938,7 @@ export function matchByExactName(
     } else if (ref.referenceKind === 'references') {
       candidates = candidates.filter((node) => node.kind !== 'extension');
     }
+
   }
 
   if (candidates.length === 0) {
@@ -789,6 +964,11 @@ export function matchByExactName(
   if (candidates.length > AMBIGUOUS_NAME_CEILING) {
     return null;
   }
+
+  // A call shape was available but still leaves multiple Cangjie overloads.
+  // Source proximity cannot distinguish signatures, so do not fabricate a
+  // deterministic-looking edge to whichever declaration happens to be closer.
+  if (cangjieCallWasShaped) return null;
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
@@ -1770,6 +1950,112 @@ function cangjieConstructedTypeOnLine(line: string, name: string): string | null
   return match?.[2] ?? match?.[1] ?? null;
 }
 
+function cangjieArrayInitializerOnLines(
+  lines: string[],
+  startIndex: number,
+  name: string
+): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const start = lines[startIndex]?.match(
+    new RegExp(
+      `^\\s*(?:let|var)\\s+${escaped}(?![\\p{L}\\p{N}_])` +
+        `(?:\\s*:\\s*[^=]+)?\\s*=\\s*(\\[.*)$`,
+      'u'
+    )
+  )?.[1];
+  if (!start) return null;
+
+  let result = '';
+  let depth = 0;
+  let quote = '';
+  let escapedCharacter = false;
+  for (
+    let index = startIndex;
+    index < lines.length && index < startIndex + 200 && result.length < 100_000;
+    index++
+  ) {
+    const segment = index === startIndex ? start : `\n${lines[index] ?? ''}`;
+    const offset = result.length;
+    result += segment;
+    for (let characterIndex = 0; characterIndex < segment.length; characterIndex++) {
+      const character = segment[characterIndex]!;
+      if (quote) {
+        if (escapedCharacter) {
+          escapedCharacter = false;
+        } else if (character === '\\') {
+          escapedCharacter = true;
+        } else if (character === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === '[') {
+        depth++;
+      } else if (character === ']') {
+        depth--;
+        if (depth === 0) {
+          return result.slice(0, offset + characterIndex + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function cangjieMatchInitializerOnLines(
+  lines: string[],
+  startIndex: number,
+  name: string
+): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const start = lines[startIndex]?.match(
+    new RegExp(
+      `^\\s*(?:let|var)\\s+${escaped}(?![\\p{L}\\p{N}_])` +
+        `(?:\\s*:\\s*[^=]+)?\\s*=\\s*(match\\b.*)$`,
+      'u'
+    )
+  )?.[1];
+  if (!start) return null;
+
+  let result = '';
+  let braces = 0;
+  let sawBrace = false;
+  let quote = '';
+  let escapedCharacter = false;
+  for (
+    let index = startIndex;
+    index < lines.length && index < startIndex + 200 && result.length < 100_000;
+    index++
+  ) {
+    const segment = index === startIndex ? start : `\n${lines[index] ?? ''}`;
+    result += segment;
+    for (const character of segment) {
+      if (quote) {
+        if (escapedCharacter) {
+          escapedCharacter = false;
+        } else if (character === '\\') {
+          escapedCharacter = true;
+        } else if (character === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === '{') {
+        sawBrace = true;
+        braces++;
+      } else if (character === '}') {
+        braces--;
+        if (sawBrace && braces === 0) return result;
+      }
+    }
+  }
+  return null;
+}
+
 function cangjieTypeFromSignature(signature: string | undefined): string | null {
   if (!signature) return null;
   return (
@@ -1779,11 +2065,54 @@ function cangjieTypeFromSignature(signature: string | undefined): string | null 
   );
 }
 
+function cangjieIterableElementType(rawType: string): string | null {
+  const match = rawType
+    .trim()
+    .replace(/^[?!]+\s*/, '')
+    .match(
+      /^(?:Array|ArrayList|HashSet|LinkedList|Vector|Iterable|Collection)<(.+)>$/su
+    );
+  if (!match) return null;
+  const argumentsList = cangjieSplitTypeArguments(match[1]!);
+  return argumentsList.length === 1 ? argumentsList[0]! : null;
+}
+
+function cangjieOptionalElementType(rawType: string): string | null {
+  const trimmed = rawType.trim();
+  if (trimmed.startsWith('?')) return trimmed.slice(1).trim() || null;
+  const option = trimmed.match(/^(?:Option|Optional)<(.+)>$/su);
+  return option ? option[1]!.trim() : null;
+}
+
+function cangjieIsKnownTypeRaw(
+  rawType: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  const typeName = normalizeCangjieDeclaredType(rawType);
+  if (!typeName) return false;
+  if (cangjieImportedTypeBinding(typeName, ref, context)) return true;
+  return filterCangjiePackageCandidates(
+    context
+      .getNodesByName(typeName)
+      .filter(
+        (node) =>
+          node.language === 'cangjie' &&
+          ['class', 'struct', 'interface', 'enum', 'type_alias'].includes(
+            node.kind
+          )
+      ),
+    ref,
+    context
+  ).length > 0;
+}
+
 /** Recover `name: Type` or `let name = Type(...)` within Cangjie scope. */
 function cangjieDeclaredTypeRaw(
   name: string,
   ref: UnresolvedRef,
-  context: ResolutionContext
+  context: ResolutionContext,
+  depth = 0
 ): string | null {
   const lines =
     context.getFileLines?.(ref.filePath) ??
@@ -1792,19 +2121,220 @@ function cangjieDeclaredTypeRaw(
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const boundary = `(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`;
   const declaration = new RegExp(
-    `${boundary}\\s*:\\s*${CANGJIE_DECLARED_TYPE_PATTERN}`,
+    `${boundary}\\s*!?\\s*:\\s*${CANGJIE_DECLARED_TYPE_PATTERN}`,
     'u'
   );
   if (lines?.length) {
     const callIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
     const startIndex = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+    const forBinding = new RegExp(
+      `\\bfor\\s*\\(\\s*${boundary}\\s+in\\s+(.+)\\s*\\)\\s*\\{?`,
+      'u'
+    );
     for (let index = callIndex; index >= startIndex; index--) {
       const match = lines[index]?.match(declaration);
       if (match?.[1]) return match[1];
+      const tupleCaseBinding = lines[index]?.match(
+        /\bcase\s*\((.+)\)(?:\s+where\b[^=]*)?\s*=>/u
+      );
+      if (tupleCaseBinding && depth < 6) {
+        const patterns = splitCangjieTopLevel(tupleCaseBinding[1]!, ',');
+        const tupleIndex = patterns.findIndex((pattern) =>
+          new RegExp(
+            `^Some\\s*\\(\\s*${boundary}\\s*\\)$`,
+            'u'
+          ).test(pattern)
+        );
+        if (tupleIndex >= 0) {
+          for (
+            let matchIndex = index - 1;
+            matchIndex >= startIndex;
+            matchIndex--
+          ) {
+            const subject = lines[matchIndex]?.match(
+              /\bmatch\s*\((.+)\)\s*\{/u
+            )?.[1];
+            if (!subject) continue;
+            const subjectType = cangjieExpressionTypeRaw(
+              subject,
+              ref,
+              context,
+              depth + 1
+            );
+            if (subjectType?.startsWith('(') && subjectType.endsWith(')')) {
+              const elementTypes = splitCangjieTopLevel(
+                subjectType.slice(1, -1),
+                ','
+              );
+              const optionalType = elementTypes[tupleIndex]
+                ? cangjieOptionalElementType(elementTypes[tupleIndex]!)
+                : null;
+              if (optionalType) return optionalType;
+            }
+            break;
+          }
+        }
+      }
+      const tupleSomeBinding = lines[index]?.match(
+        /\bcase\s+Some\s*\(\s*\(([^)]+)\)\s*\)(?:\s+where\b[^=]*)?\s*=>/u
+      );
+      if (tupleSomeBinding && depth < 6) {
+        const names = splitCangjieTopLevel(tupleSomeBinding[1]!, ',');
+        const tupleIndex = names.indexOf(name);
+        if (tupleIndex >= 0) {
+          for (
+            let matchIndex = index - 1;
+            matchIndex >= startIndex;
+            matchIndex--
+          ) {
+            const subject = lines[matchIndex]?.match(
+              /\bmatch\s*\((.+)\)\s*\{/u
+            )?.[1];
+            if (!subject) continue;
+            const subjectType = cangjieExpressionTypeRaw(
+              subject,
+              ref,
+              context,
+              depth + 1
+            );
+            const elementType = subjectType
+              ? cangjieOptionalElementType(subjectType)
+              : null;
+            if (elementType?.startsWith('(') && elementType.endsWith(')')) {
+              const elementTypes = splitCangjieTopLevel(
+                elementType.slice(1, -1),
+                ','
+              );
+              if (elementTypes.length === names.length) {
+                return elementTypes[tupleIndex] ?? null;
+              }
+            }
+            break;
+          }
+        }
+      }
+      const someBinding = lines[index]?.match(
+        new RegExp(
+          `\\bcase\\s+Some\\s*\\(\\s*${boundary}\\s*\\)(?:\\s+where\\b[^=]*)?\\s*=>`,
+          'u'
+        )
+      );
+      if (someBinding && depth < 6) {
+        for (let matchIndex = index - 1; matchIndex >= startIndex; matchIndex--) {
+          const subject = lines[matchIndex]?.match(
+            /\bmatch\s*\((.+)\)\s*\{/u
+          )?.[1];
+          if (!subject) continue;
+          const subjectType = cangjieExpressionTypeRaw(
+            subject,
+            ref,
+            context,
+            depth + 1
+          );
+          const elementType = subjectType
+            ? cangjieOptionalElementType(subjectType)
+            : null;
+          if (elementType) return elementType;
+          break;
+        }
+      }
+      if (depth < 6 && lines[index]) {
+        const iterable = lines[index]!.match(forBinding)?.[1];
+        if (iterable) {
+          const iterableType = cangjieExpressionTypeRaw(
+            iterable,
+            ref,
+            context,
+            depth + 1
+          );
+          const elementType = iterableType
+            ? cangjieIterableElementType(iterableType)
+            : null;
+          if (elementType) return elementType;
+        }
+      }
+      if (depth < 6 && lines[index]) {
+        const tupleBinding = lines[index]!.trim().match(
+          /^(?:let|var)\s*\(([^)]+)\)\s*=\s*(.+?)\s*;?$/u
+        );
+        if (tupleBinding) {
+          const names = splitCangjieTopLevel(tupleBinding[1]!, ',');
+          const tupleIndex = names.indexOf(name);
+          if (tupleIndex >= 0) {
+            const tupleType = cangjieExpressionTypeRaw(
+              tupleBinding[2]!,
+              ref,
+              context,
+              depth + 1
+            );
+            if (tupleType?.startsWith('(') && tupleType.endsWith(')')) {
+              const elementTypes = splitCangjieTopLevel(
+                tupleType.slice(1, -1),
+                ','
+              );
+              if (elementTypes.length === names.length) {
+                return elementTypes[tupleIndex] ?? null;
+              }
+            }
+          }
+        }
+        const localBinding = lines[index]!.trim().match(
+          /^(?:let|var)\s+([\p{L}_][\p{L}\p{N}_]*)\s*=\s*([^;]+?)\s*;?$/u
+        );
+        const initializer =
+          cangjieMatchInitializerOnLines(lines, index, name) ??
+          cangjieArrayInitializerOnLines(lines, index, name) ??
+          (localBinding?.[1] === name ? localBinding[2] : undefined);
+        if (initializer) {
+          const inferred = cangjieExpressionTypeRaw(
+            initializer,
+            ref,
+            context,
+            depth + 1
+          );
+          if (inferred) return inferred;
+        }
+      }
       const constructed = lines[index]
         ? cangjieConstructedTypeOnLine(lines[index]!, name)
         : null;
-      if (constructed) return constructed;
+      // Retain a fallback for a multiline direct constructor whose complete
+      // initializer is unavailable on this line. Complete one-line
+      // initializers are evaluated first so `Type().factory()` uses the
+      // factory's return type rather than stopping at `Type`.
+      if (constructed && cangjieIsKnownTypeRaw(constructed, ref, context)) {
+        return constructed;
+      }
+    }
+  }
+
+  // Local declarations are indexed with their initializer in `signature`.
+  // Use that structural record as a fallback for multiline formatting and for
+  // contexts whose cached source lines are unavailable.
+  if (depth < 6) {
+    const scopeStart = enclosingScopeStartLine(ref, context);
+    const locals = context
+      .getNodesInFile(ref.filePath)
+      .filter(
+        (node) =>
+          node.name === name &&
+          (node.kind === 'variable' || node.kind === 'constant') &&
+          node.startLine >= scopeStart &&
+          node.startLine <= ref.line
+      )
+      .sort((left, right) => right.startLine - left.startLine);
+    for (const local of locals) {
+      const explicit = cangjieTypeFromSignature(local.signature);
+      if (explicit) return explicit;
+      const initializer = local.signature?.match(/^\s*=\s*(.+)$/s)?.[1];
+      if (!initializer) continue;
+      const inferred = cangjieExpressionTypeRaw(
+        initializer,
+        ref,
+        context,
+        depth + 1
+      );
+      if (inferred) return inferred;
     }
   }
 
@@ -1818,11 +2348,711 @@ function cangjieDeclaredTypeRaw(
       node.startLine >= enclosing.startLine &&
       (node.endLine ?? node.startLine) <= end
   );
-  if (!field) return null;
-  const signatureType = cangjieTypeFromSignature(field.signature);
-  if (signatureType) return signatureType;
-  const fieldLine = lines?.[Math.max(0, field.startLine - 1)];
-  return fieldLine ? cangjieConstructedTypeOnLine(fieldLine, name) : null;
+  if (field) {
+    const signatureType = cangjieTypeFromSignature(field.signature);
+    if (signatureType) return signatureType;
+    const fieldLine = lines?.[Math.max(0, field.startLine - 1)];
+    const constructed = fieldLine
+      ? cangjieConstructedTypeOnLine(fieldLine, name)
+      : null;
+    if (constructed) return constructed;
+  }
+  return cangjieCommonValueType(
+    cangjieMembersOnType(
+      enclosing.name,
+      name,
+      ['field', 'constant', 'property'],
+      ref,
+      context
+    )
+  );
+}
+
+function cangjieLastTopLevelDot(expression: string): number {
+  let parens = 0;
+  let brackets = 0;
+  let angles = 0;
+  for (let index = expression.length - 1; index >= 0; index--) {
+    switch (expression[index]) {
+      case ')':
+        parens++;
+        break;
+      case '(':
+        parens--;
+        break;
+      case ']':
+        brackets++;
+        break;
+      case '[':
+        brackets--;
+        break;
+      case '>':
+        angles++;
+        break;
+      case '<':
+        angles--;
+        break;
+      case '.':
+        if (parens === 0 && brackets === 0 && angles === 0) return index;
+        break;
+    }
+  }
+  return -1;
+}
+
+function cangjieFinalCallOpen(expression: string): number {
+  if (!expression.endsWith(')')) return -1;
+  let depth = 0;
+  for (let index = expression.length - 1; index >= 0; index--) {
+    if (expression[index] === ')') depth++;
+    else if (expression[index] === '(') {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function cangjieFinalIndexOpen(expression: string): number {
+  if (!expression.endsWith(']')) return -1;
+  let depth = 0;
+  for (let index = expression.length - 1; index >= 0; index--) {
+    if (expression[index] === ']') depth++;
+    else if (expression[index] === '[' && --depth === 0) return index;
+  }
+  return -1;
+}
+
+function cangjieFinalBlockOpen(expression: string): number {
+  if (!expression.endsWith('}')) return -1;
+  let depth = 0;
+  let quote = '';
+  for (let index = expression.length - 1; index >= 0; index--) {
+    const character = expression[index]!;
+    if (quote) {
+      if (character === quote && expression[index - 1] !== '\\') quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '}') {
+      depth++;
+    } else if (character === '{' && --depth === 0) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function cangjieNodeValueTypeRaw(node: Node): string | null {
+  if (node.kind === 'enum_member') {
+    const parts = node.qualifiedName.split('::');
+    return parts.length >= 2 ? parts[parts.length - 2]! : null;
+  }
+  const signature = node.signature;
+  if (
+    signature &&
+    (node.kind === 'function' || node.kind === 'method')
+  ) {
+    const tupleType = signature.match(/\)\s*:\s*(\??\([^)\r\n]+\))/u)?.[1];
+    if (tupleType) return tupleType;
+    const signatureType =
+      signature.match(
+        /\)\s*:\s*([?!]?(?:[\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*(?:<[^>\r\n]+>)?)/u
+      )?.[1];
+    if (signatureType) return signatureType;
+  }
+  if (node.returnType) return node.returnType;
+  if (!signature) return null;
+  const initializerType = signature.match(
+    /=\s*([?!]?(?:[\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*(?:<[^>\r\n]+>)?)\s*[({]/u
+  )?.[1];
+  if (initializerType) return initializerType;
+  return cangjieTypeFromSignature(signature);
+}
+
+function cangjieSplitTypeArguments(raw: string): string[] {
+  const result: string[] = [];
+  let start = 0;
+  let angle = 0;
+  let paren = 0;
+  let bracket = 0;
+  for (let index = 0; index < raw.length; index++) {
+    switch (raw[index]) {
+      case '<':
+        angle++;
+        break;
+      case '>':
+        angle--;
+        break;
+      case '(':
+        paren++;
+        break;
+      case ')':
+        paren--;
+        break;
+      case '[':
+        bracket++;
+        break;
+      case ']':
+        bracket--;
+        break;
+      case ',':
+        if (angle === 0 && paren === 0 && bracket === 0) {
+          result.push(raw.slice(start, index).trim());
+          start = index + 1;
+        }
+        break;
+    }
+  }
+  result.push(raw.slice(start).trim());
+  return result.filter(Boolean);
+}
+
+function cangjieSubstituteReceiverTypeParameters(
+  valueType: string,
+  receiverRawType: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): string {
+  const receiver = receiverRawType
+    .trim()
+    .replace(/^[?!]+\s*/, '')
+    .match(
+      /^((?:[\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*)<(.+)>$/su
+    );
+  if (!receiver) return valueType;
+  const receiverName = receiver[1]!.split('.').pop()!;
+  const argumentsList = cangjieSplitTypeArguments(receiver[2]!);
+  const imported = cangjieImportedTypeBinding(receiverName, ref, context);
+  const typeNodes = imported
+    ? cangjieVisibleCandidates(
+        imported.packageName,
+        imported.name,
+        ref,
+        context
+      )
+    : filterCangjiePackageCandidates(
+        context
+          .getNodesByName(receiverName)
+          .filter(
+            (node) =>
+              node.language === 'cangjie' &&
+              ['class', 'struct', 'interface', 'enum'].includes(node.kind)
+          ),
+        ref,
+        context
+      );
+  const parameterLists = typeNodes
+    .map((node) => node.typeParameters ?? [])
+    .filter((parameters) => parameters.length === argumentsList.length);
+  if (parameterLists.length === 0) return valueType;
+  const first = parameterLists[0]!;
+  if (
+    parameterLists.some(
+      (parameters) => parameters.join('\0') !== first.join('\0')
+    )
+  ) {
+    return valueType;
+  }
+  let substituted = valueType;
+  first.forEach((parameter, index) => {
+    const escaped = parameter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    substituted = substituted.replace(
+      new RegExp(
+        `(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`,
+        'gu'
+      ),
+      argumentsList[index]!
+    );
+  });
+  return substituted;
+}
+
+function cangjieCommonValueType(
+  nodes: Node[],
+  receiverRawType?: string,
+  ref?: UnresolvedRef,
+  context?: ResolutionContext
+): string | null {
+  const types = nodes
+    .map(cangjieNodeValueTypeRaw)
+    .filter((type): type is string => type !== null);
+  if (types.length === 0) return null;
+  const effectiveTypes =
+    receiverRawType && ref && context
+      ? types.map((type) =>
+          cangjieSubstituteReceiverTypeParameters(
+            type,
+            receiverRawType,
+            ref,
+            context
+          )
+        )
+      : types;
+  const normalized = new Set(
+    effectiveTypes
+      .map((type) => normalizeCangjieDeclaredType(type))
+      .filter(Boolean)
+  );
+  if (normalized.size === 1) return effectiveTypes[0]!;
+  const exact = new Set(effectiveTypes.map((type) => type.replace(/\s+/g, '')));
+  return exact.size === 1 ? effectiveTypes[0]! : null;
+}
+
+function cangjieMemberCandidatesOnRawType(
+  rawType: string,
+  memberName: string,
+  kinds: Node['kind'][],
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node[] {
+  const typeName = normalizeCangjieDeclaredType(rawType);
+  if (!typeName) return [];
+  const importedType = cangjieImportedTypeBinding(typeName, ref, context);
+  if (importedType) {
+    const direct = cangjieImportedTypeMembers(
+      importedType,
+      memberName,
+      kinds,
+      context
+    );
+    if (direct.length > 0) return direct;
+  }
+  const visible = cangjieMembersOnType(
+    typeName,
+    memberName,
+    kinds,
+    ref,
+    context
+  );
+  if (visible.length > 0) return visible;
+
+  // An inferred return type does not need to be named in the caller's imports:
+  // `let (_, axes) = Figure.single()` can expose `plot.axes.Axes` while the
+  // source imports only `plot.Figure`. When the public type name is globally
+  // unique, its package identity is still statically proven and its public
+  // members are safe to follow.
+  return cangjiePublicMembersOnUniqueType(
+    typeName,
+    memberName,
+    kinds,
+    context
+  );
+}
+
+function cangjiePublicMembersOnUniqueType(
+  typeName: string,
+  memberName: string,
+  kinds: Node['kind'][],
+  context: ResolutionContext,
+  depth = 0,
+  seen = new Set<string>()
+): Node[] {
+  if (depth > 4 || seen.has(typeName)) return [];
+  seen.add(typeName);
+  const declarations = context
+    .getNodesByName(typeName)
+    .filter(
+      (node) =>
+        node.language === 'cangjie' &&
+        node.isExported &&
+        ['class', 'struct', 'interface', 'enum'].includes(node.kind)
+    );
+  if (declarations.length !== 1) return [];
+  const qualifiedName =
+    `${cangjiePackageName(declarations[0]!)}::${typeName}::${memberName}`;
+  const direct = context
+    .getNodesByName(memberName)
+    .filter(
+      (node) =>
+        node.language === 'cangjie' &&
+        node.isExported &&
+        kinds.includes(node.kind) &&
+        node.qualifiedName === qualifiedName
+    );
+  if (direct.length > 0) return direct;
+
+  const declaration = declarations[0]!;
+  const lines =
+    context.getFileLines?.(declaration.filePath) ??
+    context.readFile(declaration.filePath)?.split(/\r?\n/) ??
+    [];
+  const header = lines
+    .slice(
+      Math.max(0, declaration.startLine - 1),
+      Math.min(lines.length, declaration.startLine + 12)
+    )
+    .join(' ')
+    .split('{', 1)[0]!;
+  const supertypes = new Set(
+    context.getSupertypes?.(typeName, 'cangjie') ?? []
+  );
+  for (const supertype of
+    header
+      .match(/<:\s*(.+)$/u)?.[1]
+      ?.replace(/\s+where\b.*$/u, '')
+      .split('&')
+      .map((raw) => normalizeCangjieDeclaredType(raw))
+      .filter((name): name is string => !!name && name !== typeName) ?? []) {
+    supertypes.add(supertype);
+  }
+  return [
+    ...new Map(
+      [...supertypes]
+        .flatMap((supertype) =>
+          cangjiePublicMembersOnUniqueType(
+            supertype,
+            memberName,
+            kinds,
+            context,
+            depth + 1,
+            seen
+          )
+        )
+        .map((node) => [node.id, node])
+    ).values(),
+  ];
+}
+
+function cangjieCallableMemberCandidatesOnRawType(
+  rawType: string,
+  memberName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node[] {
+  return cangjieMemberCandidatesOnRawType(
+    rawType,
+    memberName,
+    ['method', 'field', 'property'],
+    ref,
+    context
+  ).filter(
+    (candidate) =>
+      candidate.kind === 'method' ||
+      candidate.signature?.includes('->') ||
+      candidate.returnType?.includes('->')
+  );
+}
+
+/**
+ * Return a type's declared Cangjie supertypes even while the current
+ * resolution pass has not persisted its `extends`/`implements` edges yet.
+ * Reference rows have no guaranteed order, so receiver calls in a child type
+ * must not depend on the header reference being visited first.
+ */
+function cangjieDeclaredSupertypes(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): string[] {
+  const result = new Set(
+    context.getSupertypes?.(typeName, 'cangjie') ?? []
+  );
+  const declarations = filterCangjiePackageCandidates(
+    context
+      .getNodesByName(typeName)
+      .filter(
+        (node) =>
+          node.language === 'cangjie' &&
+          ['class', 'struct', 'interface', 'enum'].includes(node.kind)
+      ),
+    ref,
+    context
+  );
+  for (const declaration of declarations) {
+    const lines =
+      context.getFileLines?.(declaration.filePath) ??
+      context.readFile(declaration.filePath)?.split(/\r?\n/) ??
+      [];
+    const header = lines
+      .slice(
+        Math.max(0, declaration.startLine - 1),
+        Math.min(lines.length, declaration.startLine + 12)
+      )
+      .join(' ')
+      .split('{', 1)[0]!;
+    const inherited = header
+      .match(/<:\s*(.+)$/u)?.[1]
+      ?.replace(/\s+where\b.*$/u, '')
+      .split('&')
+      .map((raw) => normalizeCangjieDeclaredType(raw))
+      .filter((name): name is string => !!name && name !== typeName) ?? [];
+    inherited.forEach((name) => result.add(name));
+  }
+  return [...result];
+}
+
+/**
+ * Infer the value type of the restricted expression forms used as Cangjie
+ * member receivers. This is deliberately a small, statically corroborated
+ * evaluator: locals/parameters, constructors, function returns, method-call
+ * returns and field/property chains. A miss stays unresolved.
+ */
+function cangjieExpressionTypeRaw(
+  rawExpression: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth = 0
+): string | null {
+  if (depth > 6) return null;
+  const spacedExpression = rawExpression.trim();
+  let expression = spacedExpression.replace(/\s+/g, '');
+  expression = expression.replace(/\?\./g, '.').replace(/\?$/, '');
+  if (!expression) return null;
+
+  if (expression.startsWith('(') && expression.endsWith(')')) {
+    const elements = splitCangjieTopLevel(expression.slice(1, -1), ',');
+    if (elements.length > 1) {
+      const elementTypes = elements
+        .map((element) =>
+          cangjieExpressionTypeRaw(element, ref, context, depth + 1)
+        )
+        .filter((type): type is string => !!type);
+      if (elementTypes.length === elements.length) {
+        return `(${elementTypes.join(', ')})`;
+      }
+    }
+  }
+
+  if (spacedExpression.startsWith('match')) {
+    const subject = spacedExpression.match(/^match\s*\((.+?)\)\s*\{/su)?.[1];
+    const subjectType = subject
+      ? cangjieExpressionTypeRaw(subject, ref, context, depth + 1)
+      : null;
+    const elementType = subjectType
+      ? cangjieOptionalElementType(subjectType)
+      : null;
+    if (!elementType) return null;
+    const resultTypes: string[] = [];
+    const branches =
+      spacedExpression.matchAll(
+        /\bcase\s+Some\s*\(\s*([\p{L}_][\p{L}\p{N}_]*)\s*\)(?:\s+where\b[^=]*)?\s*=>\s*([^\r\n}]+)/gu
+      );
+    for (const branch of branches) {
+      const binding = branch[1]!;
+      const value = branch[2]!.trim().replace(/\s+/g, '');
+      if (value === binding) {
+        resultTypes.push(elementType);
+        continue;
+      }
+      const memberCall = value.match(
+        new RegExp(
+          `^${binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` +
+            `\\.([\\p{L}_][\\p{L}\\p{N}_]*)\\s*\\(`,
+          'u'
+        )
+      );
+      if (!memberCall) continue;
+      const valueType = cangjieCommonValueType(
+        cangjieMemberCandidatesOnRawType(
+          elementType,
+          memberCall[1]!,
+          ['method'],
+          ref,
+          context
+        ),
+        elementType,
+        ref,
+        context
+      );
+      if (valueType) resultTypes.push(valueType);
+    }
+    if (resultTypes.length === 0) return null;
+    const normalized = new Set(
+      resultTypes
+        .map((type) => normalizeCangjieDeclaredType(type))
+        .filter(Boolean)
+    );
+    return normalized.size === 1 ? resultTypes[0]! : null;
+  }
+
+  if (expression === 'this') {
+    return enclosingCangjieType(ref, context)?.name ?? null;
+  }
+  if (expression === 'super') {
+    const owner = enclosingCangjieType(ref, context);
+    if (!owner) return null;
+    const classSupertypes = cangjieDeclaredSupertypes(
+      owner.name,
+      ref,
+      context
+    ).filter((supertype) =>
+      context
+        .getNodesByName(supertype)
+        .some(
+          (node) =>
+            node.language === 'cangjie' &&
+            node.kind === 'class'
+        )
+    );
+    return classSupertypes.length === 1 ? classSupertypes[0]! : null;
+  }
+
+  if (expression.startsWith('[') && expression.endsWith(']')) {
+    const elements = splitCangjieTopLevel(expression.slice(1, -1), ',');
+    if (elements.length === 0) return null;
+    const elementTypes = elements
+      .map((element) =>
+        cangjieExpressionTypeRaw(element, ref, context, depth + 1)
+      )
+      .filter((type): type is string => !!type);
+    if (elementTypes.length !== elements.length) return null;
+    const normalized = new Set(
+      elementTypes
+        .map((type) => normalizeCangjieDeclaredType(type))
+        .filter(Boolean)
+    );
+    return normalized.size === 1 ? `Array<${elementTypes[0]!}>` : null;
+  }
+
+  // Cangjie permits a final lambda outside the parentheses:
+  // `ScrollView() { emit(child) }`. The lambda changes call arity but not the
+  // value type of the call, so peel it before evaluating a chained receiver.
+  const blockOpen = cangjieFinalBlockOpen(expression);
+  if (blockOpen > 0) {
+    const callWithoutTrailingLambda = expression.slice(0, blockOpen);
+    if (callWithoutTrailingLambda.endsWith(')')) {
+      return cangjieExpressionTypeRaw(
+        callWithoutTrailingLambda,
+        ref,
+        context,
+        depth + 1
+      );
+    }
+  }
+
+  const indexOpen = cangjieFinalIndexOpen(expression);
+  if (indexOpen > 0) {
+    const receiverExpression = expression.slice(0, indexOpen);
+    const receiverType = cangjieExpressionTypeRaw(
+      receiverExpression,
+      ref,
+      context,
+      depth + 1
+    );
+    if (!receiverType) return null;
+    const elementType = cangjieIterableElementType(receiverType);
+    if (elementType) return elementType;
+    const indexArity = splitCangjieTopLevel(
+      expression.slice(indexOpen + 1, -1),
+      ','
+    ).length;
+    const getters = cangjieMemberCandidatesOnRawType(
+      receiverType,
+      'operator[]',
+      ['method'],
+      ref,
+      context
+    ).filter(
+      (candidate) =>
+        cangjieSignatureParameters(candidate.signature)?.length === indexArity
+    );
+    return cangjieCommonValueType(getters, receiverType, ref, context);
+  }
+
+  const callOpen = cangjieFinalCallOpen(expression);
+  if (callOpen > 0) {
+    const callee = expression.slice(0, callOpen);
+    const dot = cangjieLastTopLevelDot(callee);
+    if (dot >= 0) {
+      const receiverExpression = callee.slice(0, dot);
+      const methodName = callee.slice(dot + 1).replace(/<.*$/s, '');
+      const receiverType = cangjieExpressionTypeRaw(
+        receiverExpression,
+        ref,
+        context,
+        depth + 1
+      );
+      if (!receiverType || !methodName) return null;
+      return cangjieCommonValueType(
+        cangjieMemberCandidatesOnRawType(
+          receiverType,
+          methodName,
+          ['method', 'enum_member'],
+          ref,
+          context
+        ),
+        receiverType,
+        ref,
+        context
+      );
+    }
+
+    const simpleCallee = callee.replace(/<.*$/s, '');
+    if (cangjieIsKnownTypeRaw(callee, ref, context)) {
+      return callee;
+    }
+
+    let functions = filterCangjiePackageCandidates(
+      context
+        .getNodesByName(simpleCallee)
+        .filter(
+          (node) =>
+            node.language === 'cangjie' &&
+            node.kind === 'function' &&
+            isLexicallyReachable(node, ref, context)
+        ),
+      ref,
+      context
+    );
+    const owner = enclosingCangjieType(ref, context);
+    if (owner) {
+      const methods = cangjieMembersOnType(
+        owner.name,
+        simpleCallee,
+        ['method'],
+        ref,
+        context
+      );
+      if (methods.length > 0) functions = methods;
+    }
+    return cangjieCommonValueType(functions);
+  }
+
+  const dot = cangjieLastTopLevelDot(expression);
+  if (dot >= 0) {
+    const receiverExpression = expression.slice(0, dot);
+    const memberName = expression.slice(dot + 1);
+    const receiverType = cangjieExpressionTypeRaw(
+      receiverExpression,
+      ref,
+      context,
+      depth + 1
+    );
+    if (!receiverType || !memberName) return null;
+    return cangjieCommonValueType(
+      cangjieMemberCandidatesOnRawType(
+        receiverType,
+        memberName,
+        ['field', 'property', 'constant', 'enum_member'],
+        ref,
+        context
+      ),
+      receiverType,
+      ref,
+      context
+    );
+  }
+
+  if (/^[\p{L}_][\p{L}\p{N}_]*$/u.test(expression)) {
+    const declared = cangjieDeclaredTypeRaw(expression, ref, context, depth + 1);
+    if (declared) return declared;
+    if (cangjieImportedTypeBinding(expression, ref, context)) return expression;
+    const namedTypes = filterCangjiePackageCandidates(
+      context
+        .getNodesByName(expression)
+        .filter(
+          (node) =>
+            node.language === 'cangjie' &&
+            ['class', 'struct', 'interface', 'enum'].includes(node.kind)
+        ),
+      ref,
+      context
+    );
+    if (namedTypes.length === 1) return expression;
+  }
+  return null;
 }
 
 function cangjieMembersOnType(
@@ -1851,7 +3081,35 @@ function cangjieMembersOnType(
     context
   );
   if (direct.length > 0) return direct;
-  const inherited = (context.getSupertypes?.(typeName, 'cangjie') ?? []).flatMap(
+  const aliases = filterCangjiePackageCandidates(
+    context
+      .getNodesByName(typeName)
+      .filter((node) => node.language === 'cangjie' && node.kind === 'type_alias'),
+    ref,
+    context
+  )
+    .map((node) => {
+      const target = node.signature?.match(
+        /=\s*[?!]?(?:[\p{L}_][\p{L}\p{N}_]*\.)*([\p{L}_][\p{L}\p{N}_]*)(?:\s*<|(?:\s+where\b)|\s*$)/u
+      )?.[1];
+      return target && target !== typeName ? target : null;
+    })
+    .filter((target): target is string => target !== null);
+  const aliased = aliases.flatMap((target) =>
+    cangjieMembersOnType(
+      target,
+      memberName,
+      kinds,
+      ref,
+      context,
+      depth + 1,
+      seen
+    )
+  );
+  if (aliased.length > 0) {
+    return [...new Map(aliased.map((node) => [node.id, node])).values()];
+  }
+  const inherited = cangjieDeclaredSupertypes(typeName, ref, context).flatMap(
     (supertype) =>
       cangjieMembersOnType(
         supertype,
@@ -1866,12 +3124,290 @@ function cangjieMembersOnType(
   return [...new Map(inherited.map((node) => [node.id, node])).values()];
 }
 
+interface CangjieCallArgument {
+  type?: string;
+  label?: string;
+}
+
+interface CangjieParameter {
+  name: string;
+  type: string;
+  hasDefault: boolean;
+  isNamed: boolean;
+  variadicElementType?: string;
+}
+
+function splitCangjieTopLevel(text: string, delimiter: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  const closing: Record<string, string> = { '(': ')', '[': ']', '{': '}', '<': '>' };
+  const stack: string[] = [];
+  let quote = '';
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index]!;
+    if (quote) {
+      if (character === '\\') index++;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (closing[character]) {
+      stack.push(closing[character]!);
+      continue;
+    }
+    if (stack[stack.length - 1] === character) {
+      stack.pop();
+      continue;
+    }
+    if (character === delimiter && stack.length === 0) {
+      parts.push(text.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  parts.push(text.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+function cangjieTopLevelIndex(text: string, wanted: string): number {
+  const closing: Record<string, string> = { '(': ')', '[': ']', '{': '}', '<': '>' };
+  const stack: string[] = [];
+  let quote = '';
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index]!;
+    if (quote) {
+      if (character === '\\') index++;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (closing[character]) {
+      stack.push(closing[character]!);
+      continue;
+    }
+    if (stack[stack.length - 1] === character) {
+      stack.pop();
+      continue;
+    }
+    if (character === wanted && stack.length === 0) return index;
+  }
+  return -1;
+}
+
+function cangjieSignatureParameters(signature: string | undefined): CangjieParameter[] | null {
+  if (!signature) return null;
+  let open = -1;
+  let angleDepth = 0;
+  for (let index = 0; index < signature.length; index++) {
+    const character = signature[index]!;
+    if (character === '<') angleDepth++;
+    else if (character === '>') angleDepth = Math.max(0, angleDepth - 1);
+    else if (character === '(' && angleDepth === 0) {
+      open = index;
+      break;
+    }
+  }
+  if (open < 0) return null;
+  let depth = 0;
+  let close = -1;
+  for (let index = open; index < signature.length; index++) {
+    if (signature[index] === '(') depth++;
+    else if (signature[index] === ')' && --depth === 0) {
+      close = index;
+      break;
+    }
+  }
+  if (close < 0) return null;
+  const rawParameters = splitCangjieTopLevel(signature.slice(open + 1, close), ',');
+  const parameters: CangjieParameter[] = [];
+  for (const raw of rawParameters) {
+    const colon = cangjieTopLevelIndex(raw, ':');
+    if (colon < 0) return null;
+    const binding = raw.slice(0, colon).trim();
+    const defaultIndex = cangjieTopLevelIndex(raw.slice(colon + 1), '=');
+    const type = raw
+      .slice(colon + 1, defaultIndex < 0 ? undefined : colon + 1 + defaultIndex)
+      .trim();
+    const name = binding
+      .replace(/\b(?:let|var|const|inout)\b/gu, '')
+      .replace(/!/g, '')
+      .trim()
+      .split(/\s+/u)
+      .pop() ?? '';
+    if (!name || !type) return null;
+    parameters.push({
+      name,
+      type,
+      hasDefault: defaultIndex >= 0,
+      isNamed: binding.includes('!'),
+    });
+  }
+  const last = parameters[parameters.length - 1];
+  if (last && !last.isNamed) {
+    const elementType = last.type.match(/^\s*Array\s*<([\s\S]+)>\s*$/u)?.[1]?.trim();
+    if (elementType) last.variadicElementType = elementType;
+  }
+  return parameters;
+}
+
+function cangjieCallArguments(ref: UnresolvedRef): CangjieCallArgument[] | null {
+  const arityHint = ref.candidates?.find((candidate) =>
+    candidate.startsWith('@cangjie/arity=')
+  );
+  const arity = arityHint
+    ? Number.parseInt(arityHint.slice('@cangjie/arity='.length), 10)
+    : Number.NaN;
+  if (!Number.isInteger(arity) || arity < 0 || arity > 1024) return null;
+  const arguments_: CangjieCallArgument[] = Array.from({ length: arity }, () => ({}));
+  for (const hint of ref.candidates ?? []) {
+    const match = hint.match(/^@cangjie\/(type|label):(\d+)=(.*)$/u);
+    if (!match) continue;
+    const index = Number.parseInt(match[2]!, 10);
+    if (index < 0 || index >= arguments_.length || !match[3]) continue;
+    arguments_[index]![match[1] === 'type' ? 'type' : 'label'] = match[3];
+  }
+  return arguments_;
+}
+
+function normalizeCangjieCallType(type: string): string {
+  let normalized = type.trim().replace(/^[?!]+\s*/u, '');
+  if (normalized.includes('->')) return 'Function';
+  normalized = normalized.replace(/<.*$/s, '').trim();
+  const simple = normalized.split('.').pop()?.trim() ?? normalized;
+  return simple === 'Byte' ? 'UInt8' : simple;
+}
+
+function scoreCangjieCallType(
+  argumentType: string | undefined,
+  parameterType: string,
+  variadicElementType: string | undefined,
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): number {
+  if (!argumentType) return 0;
+  let actual = argumentType;
+  if (actual.startsWith('$var:')) {
+    const raw = cangjieDeclaredTypeRaw(actual.slice('$var:'.length), ref, context);
+    if (!raw) return 0;
+    actual = raw;
+  }
+  const normalizedActual = normalizeCangjieCallType(actual);
+  const expected =
+    variadicElementType && normalizedActual !== 'Array'
+      ? normalizeCangjieCallType(variadicElementType)
+      : normalizeCangjieCallType(parameterType);
+  if (expected === normalizedActual) return 4;
+  if (candidate.typeParameters?.includes(expected)) return 1;
+  return -3;
+}
+
+/**
+ * Narrow same-named Cangjie overloads with the call shape recorded by the
+ * extractor. Parameter count and named labels are hard semantic constraints;
+ * statically known argument types rank the surviving overloads. A tie is left
+ * unresolved instead of being broken by source-line proximity.
+ */
+function narrowCangjieCallCandidates(
+  candidates: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): { candidates: Node[]; shaped: boolean } {
+  const callArguments = cangjieCallArguments(ref);
+  if (!callArguments || candidates.length < 2) {
+    return { candidates, shaped: false };
+  }
+
+  const scored: Array<{ candidate: Node; score: number }> = [];
+  for (const candidate of candidates) {
+    const parameters = cangjieSignatureParameters(candidate.signature);
+    if (!parameters) continue;
+    const assigned = new Set<number>();
+    let positionalCursor = 0;
+    let score = 0;
+    let compatible = true;
+    for (const argument of callArguments) {
+      let parameterIndex = -1;
+      let variadic = false;
+      if (argument.label) {
+        parameterIndex = parameters.findIndex(
+          (parameter, index) =>
+            !assigned.has(index) &&
+            parameter.isNamed &&
+            parameter.name === argument.label
+        );
+      } else {
+        while (
+          positionalCursor < parameters.length &&
+          (assigned.has(positionalCursor) || parameters[positionalCursor]!.isNamed)
+        ) {
+          positionalCursor++;
+        }
+        if (positionalCursor < parameters.length) {
+          parameterIndex = positionalCursor++;
+          variadic = !!parameters[parameterIndex]!.variadicElementType;
+        } else {
+          const lastIndex = parameters.length - 1;
+          if (lastIndex >= 0 && parameters[lastIndex]!.variadicElementType) {
+            parameterIndex = lastIndex;
+            variadic = true;
+          }
+        }
+      }
+      if (parameterIndex < 0 || parameterIndex >= parameters.length) {
+        compatible = false;
+        break;
+      }
+      assigned.add(parameterIndex);
+      score += scoreCangjieCallType(
+        argument.type,
+        parameters[parameterIndex]!.type,
+        variadic ? parameters[parameterIndex]!.variadicElementType : undefined,
+        candidate,
+        ref,
+        context
+      );
+      // Cangjie prefers an ordinary fixed-arity match over the variadic
+      // interpretation when both are viable.
+      if (!variadic) score += 1;
+    }
+    if (
+      compatible &&
+      parameters.some(
+        (parameter, index) =>
+          !assigned.has(index) &&
+          !parameter.hasDefault &&
+          !parameter.variadicElementType
+      )
+    ) {
+      compatible = false;
+    }
+    if (compatible) scored.push({ candidate, score });
+  }
+
+  if (scored.length === 0) return { candidates: [], shaped: true };
+  scored.sort((left, right) => right.score - left.score);
+  const bestScore = scored[0]!.score;
+  const best = scored.filter(({ score }) => score === bestScore).map(({ candidate }) => candidate);
+  return { candidates: best, shaped: true };
+}
+
 function chooseUniqueCangjie(
   candidates: Node[],
   ref: UnresolvedRef,
-  confidence = 0.9
+  confidence = 0.9,
+  context?: ResolutionContext
 ): ResolvedRef | null {
-  const preferred = preferCallSiteFile(candidates, ref.filePath);
+  const narrowed =
+    context && ref.referenceKind === 'calls'
+      ? narrowCangjieCallCandidates(candidates, ref, context)
+      : { candidates, shaped: false };
+  const preferred = preferCallSiteFile(narrowed.candidates, ref.filePath);
   if (preferred.length !== 1) return null;
   return {
     original: ref,
@@ -1888,18 +3424,15 @@ export function matchCangjieFieldRead(
 ): ResolvedRef | null {
   if (ref.language !== 'cangjie' || ref.referenceKind !== 'references') return null;
   const match = ref.referenceName.match(
-    /^([\p{L}\p{N}_]+)\.([\p{L}\p{N}_]+)$/u
+    /^(.*)\.([\p{L}_][\p{L}\p{N}_]*)$/u
   );
   if (!match) return null;
-  const receiver = match[1]!;
+  const receiverExpression = match[1]!;
   const member = match[2]!;
-  let typeName: string | null = null;
-  if (receiver === 'this') {
-    typeName = enclosingCangjieType(ref, context)?.name ?? null;
-  } else {
+  if (receiverExpression !== 'this') {
     const explicitType = filterCangjiePackageCandidates(
       context
-        .getNodesByName(receiver)
+        .getNodesByName(receiverExpression)
         .filter(
           (node) =>
             node.language === 'cangjie' &&
@@ -1908,38 +3441,32 @@ export function matchCangjieFieldRead(
       ref,
       context
     );
-    if (explicitType.length === 1) typeName = receiver;
-    else {
-      const raw = cangjieDeclaredTypeRaw(receiver, ref, context);
-      const declaredType = raw ? normalizeCangjieDeclaredType(raw) : null;
-      const importedType = declaredType
-        ? cangjieImportedTypeBinding(declaredType, ref, context)
-        : null;
-      if (importedType) {
-        return chooseUniqueCangjie(
-          cangjieImportedTypeMembers(
-            importedType,
-            member,
-            ['field', 'property', 'constant', 'enum_member'],
-            context
-          ),
-          ref
-        );
-      }
-      typeName = declaredType;
+    if (explicitType.length === 1) {
+      return chooseUniqueCangjie(
+        cangjieMembersOnType(
+          receiverExpression,
+          member,
+          ['field', 'property', 'constant', 'enum_member'],
+          ref,
+          context
+        ),
+        ref
+      );
     }
   }
-  if (!typeName) return null;
+
+  const rawType = cangjieExpressionTypeRaw(receiverExpression, ref, context);
+  if (!rawType) return null;
   return chooseUniqueCangjie(
-    cangjieMembersOnType(
-      typeName,
+    cangjieMemberCandidatesOnRawType(
+      rawType,
       member,
       ['field', 'property', 'constant', 'enum_member'],
       ref,
       context
     ),
     ref,
-    receiver === 'this' ? 0.95 : 0.9
+    receiverExpression === 'this' ? 0.95 : 0.9
   );
 }
 
@@ -2193,6 +3720,12 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  const cangjieCallMatch =
+    ref.language === 'cangjie'
+      ? ref.referenceName.match(
+          /^(.*)\.(operator(?:\[\]|\(\)|[^\s.]+)|[\p{L}_][\p{L}\p{N}_]*)$/u
+        )
+      : null;
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -2212,7 +3745,7 @@ export function matchMethodCall(
   const dotMatch =
     (ref.language === 'cangjie'
       ? ref.referenceName.match(
-          /^([\p{L}\p{N}_.\[\]]+)\.([\p{L}\p{N}_]+)$/u
+          /^([\p{L}\p{N}_.\[\]]+)\.(operator(?:\[\]|\(\)|[^\s.]+)|[\p{L}\p{N}_]+)$/u
         )
       : null) ??
     ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
@@ -2257,6 +3790,73 @@ export function matchMethodCall(
     );
   }
 
+  // Cangjie receiver expressions retain enough syntax to propagate a proven
+  // type through `factory.make().run()`, `makeFactory().run()` and
+  // `factory.worker.run()`. Resolve this shape before the language-agnostic
+  // dotted matcher, whose receiver grammar intentionally excludes calls.
+  if (cangjieCallMatch) {
+    const receiverExpression = cangjieCallMatch[1]!;
+    const methodName = cangjieCallMatch[2]!;
+    if (receiverExpression === 'this') {
+      const owner = enclosingCangjieType(ref, context)?.name;
+      return owner
+        ? chooseUniqueCangjie(
+            cangjieMembersOnType(owner, methodName, ['method'], ref, context),
+            ref,
+            0.95,
+            context
+          )
+        : null;
+    }
+
+    if (/^[\p{L}_][\p{L}\p{N}_]*$/u.test(receiverExpression)) {
+      const namedTypes = filterCangjiePackageCandidates(
+        context
+          .getNodesByName(receiverExpression)
+          .filter(
+            (node) =>
+              node.language === 'cangjie' &&
+              ['class', 'struct', 'interface', 'enum'].includes(node.kind)
+          ),
+        ref,
+        context
+      );
+      if (namedTypes.length > 0) {
+        const enumMembers = context
+          .getNodesByName(methodName)
+          .filter(
+            (node) =>
+              node.language === 'cangjie' &&
+              node.kind === 'enum_member' &&
+              node.qualifiedName.endsWith(
+                `::${receiverExpression}::${methodName}`
+              )
+          );
+        if (enumMembers.length > 0) {
+          return chooseUniqueCangjie(enumMembers, ref, 0.9, context);
+        }
+      }
+    }
+
+    const receiverType = cangjieExpressionTypeRaw(
+      receiverExpression,
+      ref,
+      context
+    );
+    if (!receiverType) return null;
+    return chooseUniqueCangjie(
+      cangjieCallableMemberCandidatesOnRawType(
+        receiverType,
+        methodName,
+        ref,
+        context
+      ),
+      ref,
+      receiverExpression === 'this' ? 0.95 : 0.9,
+      context
+    );
+  }
+
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {
     return null;
@@ -2266,71 +3866,6 @@ export function matchMethodCall(
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
-
-  // Cangjie is statically typed: bind `this`, named types, and local/field
-  // receivers only after validating that the method belongs to the recovered
-  // type. If no type can be proven, stay unresolved rather than falling
-  // through to the same-name fuzzy heuristics.
-  if (ref.language === 'cangjie' && dotMatch) {
-    if (objectOrClass === 'this') {
-      const owner = enclosingCangjieType(ref, context)?.name;
-      return owner
-        ? chooseUniqueCangjie(
-            cangjieMembersOnType(owner, methodName!, ['method'], ref, context),
-            ref,
-            0.95
-          )
-        : null;
-    }
-
-    const namedTypes = filterCangjiePackageCandidates(
-      context
-        .getNodesByName(objectOrClass!)
-        .filter(
-          (node) =>
-            node.language === 'cangjie' &&
-            ['class', 'struct', 'interface', 'enum'].includes(node.kind)
-        ),
-      ref,
-      context
-    );
-    if (namedTypes.length > 0) {
-      const enumMember = context
-        .getNodesByName(methodName!)
-        .filter(
-          (node) =>
-            node.language === 'cangjie' &&
-            node.kind === 'enum_member' &&
-            node.qualifiedName.endsWith(`::${objectOrClass}::${methodName}`)
-        );
-      if (enumMember.length > 0) {
-        return chooseUniqueCangjie(enumMember, ref);
-      }
-      return chooseUniqueCangjie(
-        cangjieMembersOnType(objectOrClass!, methodName!, ['method'], ref, context),
-        ref
-      );
-    }
-
-    const rawType = cangjieDeclaredTypeRaw(objectOrClass!, ref, context);
-    const declaredType = rawType ? normalizeCangjieDeclaredType(rawType) : null;
-    const importedType = declaredType
-      ? cangjieImportedTypeBinding(declaredType, ref, context)
-      : null;
-    if (importedType) {
-      return chooseUniqueCangjie(
-        cangjieImportedTypeMembers(importedType, methodName!, ['method'], context),
-        ref
-      );
-    }
-    const inferredType = declaredType;
-    return inferredType
-      ? chooseUniqueCangjie(
-          cangjieMembersOnType(inferredType, methodName!, ['method'], ref, context),
-          ref
-        )
-      : null;
-  }
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
@@ -2801,6 +4336,12 @@ export function matchFuzzy(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // Cangjie identifiers are case-sensitive and their package visibility is
+  // semantic. A case-folded last-resort match can both change the named symbol
+  // and bypass `private`/`internal`/`protected` checks, so precise Cangjie
+  // strategies deliberately leave a miss unresolved.
+  if (ref.language === 'cangjie') return null;
+
   const lowerName = ref.referenceName.toLowerCase();
 
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes

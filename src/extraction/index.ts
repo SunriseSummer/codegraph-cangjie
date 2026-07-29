@@ -1403,6 +1403,11 @@ function resurrectRefFromDroppedEdge(
   const refName = e.metadata?.refName;
   if (typeof refName !== 'string' || refName.length === 0) return null;
   const refKind = typeof e.metadata?.refKind === 'string' ? (e.metadata.refKind as ReferenceKind) : e.kind;
+  const refCandidates = Array.isArray(e.metadata?.refCandidates)
+    ? e.metadata.refCandidates.filter(
+        (candidate): candidate is string => typeof candidate === 'string'
+      )
+    : undefined;
   return {
     fromNodeId: e.source,
     referenceName: refName,
@@ -1411,6 +1416,7 @@ function resurrectRefFromDroppedEdge(
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
     language: e.sourceLanguage,
+    ...(refCandidates?.length ? { candidates: refCandidates } : {}),
   };
 }
 
@@ -2453,17 +2459,19 @@ export class ExtractionOrchestrator {
    * its refName stamp.
    */
   private reattachCrossFileEdges(
-    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetName: string; sourceFilePath: string; sourceLanguage: Language }>,
+    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetName: string; targetSignature?: string; sourceFilePath: string; sourceLanguage: Language }>,
     validNodes: Node[]
   ): void {
-    const newNodesByKindName = new Map<string, string>();
+    const newNodesByIdentity = new Map<string, string>();
     for (const n of validNodes) {
-      newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+      newNodesByIdentity.set(`${n.kind}\0${n.name}\0${n.signature ?? ''}`, n.id);
     }
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
-      const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
+      const newTargetId = newNodesByIdentity.get(
+        `${e.targetKind}\0${e.targetName}\0${e.targetSignature ?? ''}`
+      );
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
       } else {

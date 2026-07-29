@@ -136,7 +136,23 @@ mkdir -p "$OUT"
 if [ "$OSFAM" = "win32" ]; then
   ARCHIVE="$OUT/codegraph-${TARGET}.zip"
   rm -f "$ARCHIVE"
-  ( cd "$WORK" && zip -rqX "$ARCHIVE" "codegraph-${TARGET}" )
+  if command -v zip >/dev/null 2>&1; then
+    ( cd "$WORK" && zip -rqX "$ARCHIVE" "codegraph-${TARGET}" )
+  elif command -v jar >/dev/null 2>&1; then
+    # A JDK is common on Windows developer machines. Unlike
+    # Compress-Archive, jar writes portable forward-slash entry names.
+    jar --create --file "$ARCHIVE" --no-manifest -C "$WORK" "codegraph-${TARGET}"
+  elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    # Git Bash on Windows does not necessarily include `zip`. Keep local
+    # release verification usable without an extra package manager.
+    STAGE_WIN="$(cygpath -w "$STAGE")"
+    ARCHIVE_WIN="$(cygpath -w "$ARCHIVE")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "Compress-Archive -LiteralPath '$STAGE_WIN' -DestinationPath '$ARCHIVE_WIN' -CompressionLevel Optimal"
+  else
+    echo "[bundle] error: creating Windows bundles requires zip or PowerShell Compress-Archive" >&2
+    exit 1
+  fi
 else
   ARCHIVE="$OUT/codegraph-${TARGET}.tar.gz"
   # --no-xattrs: don't embed macOS xattrs that make GNU tar warn on Linux.

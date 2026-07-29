@@ -84,6 +84,123 @@ const ERLANG_MFA_CALLS = new Set([
   'erpc:call', 'erpc:cast',
 ]);
 
+function cangjieAtomicName(node: SyntaxNode, source: string): string {
+  const binding = node.namedChildren.find(
+    (child) => child.type === 'varBindingPattern' || child.type === 'identifier'
+  );
+  return binding ? getNodeText(binding, source).trim() : '';
+}
+
+function cangjieArgumentType(argument: SyntaxNode, source: string): string | null {
+  const text = getNodeText(argument, source).trim();
+  switch (argument.type) {
+    case 'integerLiteral': {
+      const suffix = text.match(/([iu])(8|16|32|64)$/i);
+      if (!suffix) return 'Int64';
+      return `${suffix[1]!.toLowerCase() === 'u' ? 'UInt' : 'Int'}${suffix[2]}`;
+    }
+    case 'floatLiteral': {
+      const suffix = text.match(/[fF](16|32|64)$/);
+      return suffix ? `Float${suffix[1]}` : 'Float64';
+    }
+    case 'stringLiteral':
+      return 'String';
+    case 'runeLiteral':
+      return 'Rune';
+    case 'byteLiteral':
+      return 'UInt8';
+    case 'booleanLiteral':
+      return 'Bool';
+    case 'unitLiteral':
+      return 'Unit';
+    case 'arrayLiteral':
+      return 'Array';
+    case 'lambdaExpression':
+    case 'trailingLambdaExpression':
+      return 'Function';
+    case 'atomicVariable': {
+      const name = cangjieAtomicName(argument, source);
+      return name ? `$var:${name}` : null;
+    }
+    case 'parenthesizedExpression':
+    case 'unaryExpression': {
+      const nested = argument.namedChild(0);
+      return nested ? cangjieArgumentType(nested, source) : null;
+    }
+    case 'postfixExpression': {
+      const first = argument.namedChild(0);
+      if (first?.type !== 'atomicVariable') return null;
+      const name = cangjieAtomicName(first, source);
+      return name && /^\p{Lu}/u.test(name) ? name : null;
+    }
+    default:
+      return null;
+  }
+}
+
+function cangjieCallShapeHints(node: SyntaxNode, source: string): string[] {
+  const argumentsAndLabels: Array<{ argument: SyntaxNode; label?: string }> = [];
+  if (node.type === 'trailingLambdaExpression') {
+    argumentsAndLabels.push({ argument: node });
+  } else if (node.type === 'callSuffix') {
+    for (let index = 0; index < node.namedChildCount; index++) {
+      const child = node.namedChild(index);
+      if (!child) continue;
+      const next = node.namedChild(index + 1);
+      const isNamedLabel =
+        child.type === 'varBindingPattern' &&
+        !!next &&
+        /^\s*:\s*$/u.test(source.slice(child.endIndex, next.startIndex));
+      if (isNamedLabel) {
+        argumentsAndLabels.push({
+          argument: next!,
+          label: getNodeText(child, source).trim(),
+        });
+        index++;
+      } else {
+        argumentsAndLabels.push({ argument: child });
+      }
+    }
+    if (node.parent?.nextNamedSibling?.type === 'trailingLambdaExpression') {
+      argumentsAndLabels.push({ argument: node.parent.nextNamedSibling });
+    }
+  } else if (node.type === 'binaryExpression') {
+    const right = getChildByField(node, 'right');
+    if (right) argumentsAndLabels.push({ argument: right });
+  } else if (node.type === 'indexAccess') {
+    for (const argument of node.namedChildren) {
+      argumentsAndLabels.push({ argument });
+    }
+    const postfix = node.parent;
+    const assignment = postfix?.parent;
+    const assignedVariable =
+      assignment?.type === 'assignmentExpression'
+        ? getChildByField(assignment, 'variable')
+        : null;
+    if (
+      postfix &&
+      assignment &&
+      assignedVariable?.startIndex === postfix.startIndex &&
+      assignedVariable.endIndex === postfix.endIndex
+    ) {
+      const value = getChildByField(assignment, 'value');
+      if (value) {
+        argumentsAndLabels.push({ argument: value, label: 'value' });
+      }
+    }
+  } else if (node.type !== 'unaryExpression') {
+    return [];
+  }
+
+  const hints = [`@cangjie/arity=${argumentsAndLabels.length}`];
+  argumentsAndLabels.forEach(({ argument, label }, index) => {
+    if (label) hints.push(`@cangjie/label:${index}=${label}`);
+    const type = cangjieArgumentType(argument, source);
+    if (type) hints.push(`@cangjie/type:${index}=${type}`);
+  });
+  return hints;
+}
+
 /**
  * Extract the name from a node based on language
  */
@@ -3835,6 +3952,58 @@ export class TreeSitterExtractor {
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
 
+    // Cangjie overloadable operators are ordinary methods named `operatorX`.
+    // Preserve the left/operand receiver so the statically typed Cangjie
+    // matcher can validate the member on that receiver's declared type.
+    if (
+      this.language === 'cangjie' &&
+      (node.type === 'binaryExpression' ||
+        node.type === 'unaryExpression' ||
+        node.type === 'indexAccess')
+    ) {
+      const receiver =
+        node.type === 'binaryExpression'
+          ? getChildByField(node, 'left')
+          : node.type === 'unaryExpression'
+            ? getChildByField(node, 'argument')
+            : node.previousNamedSibling;
+      const receiverName =
+        receiver?.type === 'atomicVariable'
+          ? (() => {
+              const binding = receiver.namedChildren.find(
+                (child: SyntaxNode) =>
+                  child.type === 'varBindingPattern' || child.type === 'identifier'
+              );
+              return binding ? getNodeText(binding, this.source).trim() : '';
+            })()
+          : receiver?.type === 'thisSuperExpression' &&
+              getNodeText(receiver, this.source).trim() === 'this'
+            ? 'this'
+            : receiver?.type === 'postfixExpression'
+              ? (() => {
+                  const first = receiver.namedChild(0);
+                  if (first?.type !== 'atomicVariable') return '';
+                  const name = cangjieAtomicName(first, this.source);
+                  return /^\p{Lu}/u.test(name) ? name : '';
+                })()
+            : '';
+      const operator =
+        node.type === 'indexAccess'
+          ? '[]'
+          : getNodeText(getChildByField(node, 'operator') ?? node, this.source).trim();
+      if (receiverName && operator) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: `${receiverName}.operator${operator}`,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+          candidates: cangjieCallShapeHints(node, this.source),
+        });
+      }
+      return;
+    }
+
     // Cangjie calls are suffixes of a postfixExpression rather than standalone
     // call nodes: `f()` is [atomicVariable, callSuffix], and `x.f()` nests the
     // receiver/field postfix immediately before the call suffix.
@@ -3846,6 +4015,9 @@ export class TreeSitterExtractor {
       if (!previous) return;
       if (node.type === 'trailingLambdaExpression' && previous.type === 'callSuffix') return;
 
+      const atomicName = (candidate: SyntaxNode): string =>
+        cangjieAtomicName(candidate, this.source);
+      const candidates = cangjieCallShapeHints(node, this.source);
       const emit = (
         referenceName: string,
         referenceKind: 'calls' | 'instantiates' = 'calls'
@@ -3856,14 +4028,8 @@ export class TreeSitterExtractor {
           referenceKind,
           line: node.startPosition.row + 1,
           column: node.startPosition.column,
+          candidates,
         });
-      };
-      const atomicName = (candidate: SyntaxNode): string => {
-        const binding = candidate.namedChildren.find(
-          (child: SyntaxNode) =>
-            child.type === 'varBindingPattern' || child.type === 'identifier'
-        );
-        return binding ? getNodeText(binding, this.source).trim() : '';
       };
       const emitMethodCall = (fieldAccess: SyntaxNode): void => {
         const memberNode = fieldAccess.namedChildren.find(
@@ -3876,8 +4042,9 @@ export class TreeSitterExtractor {
           const receiverName = atomicName(receiver);
           emit(receiverName ? `${receiverName}.${methodName}` : methodName);
         } else if (receiver?.type === 'thisSuperExpression') {
-          if (getNodeText(receiver, this.source).trim() === 'this') {
-            emit(`this.${methodName}`);
+          const keyword = getNodeText(receiver, this.source).trim();
+          if (keyword === 'this' || keyword === 'super') {
+            emit(`${keyword}.${methodName}`);
           }
         } else if (receiver?.type === 'postfixExpression') {
           let receiverText = getNodeText(receiver, this.source).replace(/\s+/g, '');
@@ -3896,13 +4063,17 @@ export class TreeSitterExtractor {
       if (previous.type === 'atomicVariable') {
         const name = atomicName(previous);
         if (!name) return;
-        // Cangjie has no `new`; conventional type names are constructor calls.
-        if (/^\p{Lu}/u.test(name)) emit(name, 'instantiates');
-        else emit(name);
+        // Cangjie has no `new`, and type names are not required to start with
+        // an uppercase letter. Emit a neutral call; symbol-aware resolution
+        // promotes class/struct/enum-constructor targets to `instantiates`.
+        emit(name);
       } else if (previous.type === 'fieldAccess') {
         emitMethodCall(previous);
       } else if (previous.type === 'thisSuperExpression') {
-        if (getNodeText(previous, this.source).trim() === 'this') emit('init');
+        const keyword = getNodeText(previous, this.source).trim();
+        if (keyword === 'this' || keyword === 'super') {
+          emit(`${keyword}.init`);
+        }
       } else if (previous.type === 'postfixExpression') {
         const suffix = previous.namedChild(previous.namedChildCount - 1);
         if (suffix?.type === 'fieldAccess') emitMethodCall(suffix);

@@ -74,7 +74,15 @@ describe('FileWatcher', () => {
     __setFsWatchForTests(null); // reset the injected fs.watch seam
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+      // On Windows, fs.watch/SQLite handles can take a short moment to finish
+      // closing after CodeGraph.unwatch()/close(). Let the built-in recursive
+      // removal retry that transient EPERM instead of making the E2E test flaky.
+      fs.rmSync(testDir, {
+        recursive: true,
+        force: true,
+        maxRetries: process.platform === 'win32' ? 10 : 0,
+        retryDelay: 50,
+      });
     }
   });
 

@@ -512,17 +512,29 @@ impl<'t> Walker<'t> {
     }
 
     fn push_ref_at(&mut self, from: u32, name: &str, kind: &str, node: Node) {
+        self.push_ref_with_candidates(from, name, kind, node, &[]);
+    }
+
+    fn push_ref_with_candidates(
+        &mut self,
+        from: u32,
+        name: &str,
+        kind: &str,
+        node: Node,
+        candidates: &[String],
+    ) {
         if name.is_empty() {
             return;
         }
         let reference_name = self.arena.put(name);
+        let candidates = self.arena.put_list(candidates);
         self.tables.push_ref(&RefRow {
             from_idx: from,
             kind: edge_kind_index(kind).unwrap(),
             line: self.line_of(node),
             column: self.column_of(node),
             reference_name,
-            candidates: NONE_STR,
+            candidates,
             from_id_str: NONE_STR,
         });
     }
@@ -631,6 +643,9 @@ impl<'t> Walker<'t> {
                 skip_children = true;
             }
             "callSuffix" | "trailingLambdaExpression" => self.extract_call(node),
+            "binaryExpression" | "unaryExpression" | "indexAccess" => {
+                self.extract_operator_call(node)
+            }
             "fieldAccess" => self.extract_field_read(node),
             _ => {}
         }
@@ -646,6 +661,9 @@ impl<'t> Walker<'t> {
     fn walk_body(&mut self, node: Node<'t>) {
         match node.kind() {
             "callSuffix" | "trailingLambdaExpression" => self.extract_call(node),
+            "binaryExpression" | "unaryExpression" | "indexAccess" => {
+                self.extract_operator_call(node)
+            }
             "fieldAccess" => self.extract_field_read(node),
             "functionDefinition"
             | "mainDefinition"
@@ -1119,7 +1137,160 @@ impl<'t> Walker<'t> {
             .unwrap_or_default()
     }
 
-    fn emit_method_call(&mut self, caller: u32, field: Node, at: Node) {
+    fn call_argument_type(&self, argument: Node<'t>) -> Option<String> {
+        let text = self.text(argument).trim();
+        match argument.kind() {
+            "integerLiteral" => {
+                let lower = text.to_ascii_lowercase();
+                for (suffix, type_name) in [
+                    ("i8", "Int8"),
+                    ("i16", "Int16"),
+                    ("i32", "Int32"),
+                    ("i64", "Int64"),
+                    ("u8", "UInt8"),
+                    ("u16", "UInt16"),
+                    ("u32", "UInt32"),
+                    ("u64", "UInt64"),
+                ] {
+                    if lower.ends_with(suffix) {
+                        return Some(type_name.to_string());
+                    }
+                }
+                Some("Int64".to_string())
+            }
+            "floatLiteral" => {
+                let lower = text.to_ascii_lowercase();
+                for (suffix, type_name) in [
+                    ("f16", "Float16"),
+                    ("f32", "Float32"),
+                    ("f64", "Float64"),
+                ] {
+                    if lower.ends_with(suffix) {
+                        return Some(type_name.to_string());
+                    }
+                }
+                Some("Float64".to_string())
+            }
+            "stringLiteral" => Some("String".to_string()),
+            "runeLiteral" => Some("Rune".to_string()),
+            "byteLiteral" => Some("UInt8".to_string()),
+            "booleanLiteral" => Some("Bool".to_string()),
+            "unitLiteral" => Some("Unit".to_string()),
+            "arrayLiteral" => Some("Array".to_string()),
+            "lambdaExpression" | "trailingLambdaExpression" => Some("Function".to_string()),
+            "atomicVariable" => {
+                let name = self.atomic_name(argument);
+                (!name.is_empty()).then(|| format!("$var:{name}"))
+            }
+            "parenthesizedExpression" | "unaryExpression" => argument
+                .named_child(0)
+                .and_then(|nested| self.call_argument_type(nested)),
+            "postfixExpression" => {
+                let first = argument.named_child(0)?;
+                if first.kind() != "atomicVariable" {
+                    return None;
+                }
+                let name = self.atomic_name(first);
+                name.chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                    .then_some(name)
+            }
+            _ => None,
+        }
+    }
+
+    fn call_shape_hints(&self, node: Node<'t>) -> Vec<String> {
+        let mut arguments: Vec<(Node<'t>, Option<String>)> = Vec::new();
+        match node.kind() {
+            "trailingLambdaExpression" => arguments.push((node, None)),
+            "callSuffix" => {
+                let mut index = 0;
+                while index < node.named_child_count() {
+                    let Some(child) = node.named_child(index) else {
+                        index += 1;
+                        continue;
+                    };
+                    let next = node.named_child(index + 1);
+                    let named_label = if child.kind() == "varBindingPattern" {
+                        next.filter(|next| {
+                            self.src[child.end_byte()..next.start_byte()].trim() == ":"
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(argument) = named_label {
+                        arguments.push((
+                            argument,
+                            Some(self.text(child).trim().to_string()),
+                        ));
+                        index += 2;
+                    } else {
+                        arguments.push((child, None));
+                        index += 1;
+                    }
+                }
+                if let Some(trailing) = node
+                    .parent()
+                    .and_then(|parent| parent.next_named_sibling())
+                    .filter(|next| next.kind() == "trailingLambdaExpression")
+                {
+                    arguments.push((trailing, None));
+                }
+            }
+            "binaryExpression" => {
+                if let Some(right) = node.child_by_field_name("right") {
+                    arguments.push((right, None));
+                }
+            }
+            "indexAccess" => {
+                for index in 0..node.named_child_count() {
+                    if let Some(argument) = node.named_child(index) {
+                        arguments.push((argument, None));
+                    }
+                }
+                if let Some(postfix) = node.parent() {
+                    if let Some(assignment) = postfix
+                        .parent()
+                        .filter(|parent| parent.kind() == "assignmentExpression")
+                    {
+                        let is_assigned_variable = assignment
+                            .child_by_field_name("variable")
+                            .is_some_and(|variable| {
+                                variable.start_byte() == postfix.start_byte()
+                                    && variable.end_byte() == postfix.end_byte()
+                            });
+                        if is_assigned_variable {
+                            if let Some(value) = assignment.child_by_field_name("value") {
+                                arguments.push((value, Some("value".to_string())));
+                            }
+                        }
+                    }
+                }
+            }
+            "unaryExpression" => {}
+            _ => return Vec::new(),
+        }
+
+        let mut hints = vec![format!("@cangjie/arity={}", arguments.len())];
+        for (index, (argument, label)) in arguments.into_iter().enumerate() {
+            if let Some(label) = label {
+                hints.push(format!("@cangjie/label:{index}={label}"));
+            }
+            if let Some(type_name) = self.call_argument_type(argument) {
+                hints.push(format!("@cangjie/type:{index}={type_name}"));
+            }
+        }
+        hints
+    }
+
+    fn emit_method_call(
+        &mut self,
+        caller: u32,
+        field: Node,
+        at: Node,
+        candidates: &[String],
+    ) {
         let Some(member_atomic) = self.first_direct_kind(field, &["atomicVariable"]) else {
             return;
         };
@@ -1139,8 +1310,10 @@ impl<'t> Walker<'t> {
                     format!("{receiver_name}.{method}")
                 }
             }
-            "thisSuperExpression" if self.text(receiver).trim() == "this" => {
-                format!("this.{method}")
+            "thisSuperExpression"
+                if matches!(self.text(receiver).trim(), "this" | "super") =>
+            {
+                format!("{}.{method}", self.text(receiver).trim())
             }
             "postfixExpression" => {
                 let mut receiver_text: String = self
@@ -1165,7 +1338,61 @@ impl<'t> Walker<'t> {
             }
             _ => return,
         };
-        self.push_ref_at(caller, &name, "calls", at);
+        self.push_ref_with_candidates(caller, &name, "calls", at, candidates);
+    }
+
+    fn extract_operator_call(&mut self, node: Node<'t>) {
+        let receiver = match node.kind() {
+            "binaryExpression" => node.child_by_field_name("left"),
+            "unaryExpression" => node.child_by_field_name("argument"),
+            "indexAccess" => node.prev_named_sibling(),
+            _ => None,
+        };
+        let Some(receiver) = receiver else {
+            return;
+        };
+        let receiver_name = match receiver.kind() {
+            "atomicVariable" => self.atomic_name(receiver),
+            "thisSuperExpression" if self.text(receiver).trim() == "this" => {
+                "this".to_string()
+            }
+            "postfixExpression" => {
+                let Some(first) = receiver.named_child(0) else {
+                    return;
+                };
+                if first.kind() != "atomicVariable" {
+                    return;
+                }
+                let name = self.atomic_name(first);
+                if !name.chars().next().is_some_and(char::is_uppercase) {
+                    return;
+                }
+                name
+            }
+            _ => return,
+        };
+        if receiver_name.is_empty() {
+            return;
+        }
+        let operator = if node.kind() == "indexAccess" {
+            "[]"
+        } else {
+            let Some(operator) = node.child_by_field_name("operator") else {
+                return;
+            };
+            self.text(operator).trim()
+        };
+        if operator.is_empty() {
+            return;
+        }
+        let candidates = self.call_shape_hints(node);
+        self.push_ref_with_candidates(
+            self.top_row(),
+            &format!("{receiver_name}.operator{operator}"),
+            "calls",
+            node,
+            &candidates,
+        );
     }
 
     fn extract_call(&mut self, node: Node<'t>) {
@@ -1176,30 +1403,34 @@ impl<'t> Walker<'t> {
         if node.kind() == "trailingLambdaExpression" && previous.kind() == "callSuffix" {
             return;
         }
+        let candidates = self.call_shape_hints(node);
         match previous.kind() {
             "atomicVariable" => {
                 let name = self.atomic_name(previous);
                 if name.is_empty() {
                     return;
                 }
-                let constructor = name.chars().next().is_some_and(char::is_uppercase);
-                self.push_ref_at(
+                self.push_ref_with_candidates(
                     caller,
                     &name,
-                    if constructor { "instantiates" } else { "calls" },
+                    "calls",
                     node,
+                    &candidates,
                 );
             }
-            "fieldAccess" => self.emit_method_call(caller, previous, node),
-            "thisSuperExpression" if self.text(previous).trim() == "this" => {
-                self.push_ref_at(caller, "init", "calls", node);
+            "fieldAccess" => self.emit_method_call(caller, previous, node, &candidates),
+            "thisSuperExpression"
+                if matches!(self.text(previous).trim(), "this" | "super") =>
+            {
+                let name = format!("{}.init", self.text(previous).trim());
+                self.push_ref_with_candidates(caller, &name, "calls", node, &candidates);
             }
             "postfixExpression" => {
                 if let Some(last) =
                     previous.named_child(previous.named_child_count().saturating_sub(1))
                 {
                     if last.kind() == "fieldAccess" {
-                        self.emit_method_call(caller, last, node);
+                        self.emit_method_call(caller, last, node, &candidates);
                     }
                 }
             }
@@ -1230,8 +1461,10 @@ impl<'t> Walker<'t> {
         let reference = if receiver.kind() == "atomicVariable" {
             let receiver_name = self.atomic_name(receiver);
             (!receiver_name.is_empty()).then(|| format!("{receiver_name}.{member}"))
-        } else if receiver.kind() == "thisSuperExpression" && self.text(receiver).trim() == "this" {
-            Some(format!("this.{member}"))
+        } else if receiver.kind() == "thisSuperExpression"
+            && matches!(self.text(receiver).trim(), "this" | "super")
+        {
+            Some(format!("{}.{member}", self.text(receiver).trim()))
         } else if receiver.kind() == "postfixExpression" {
             let receiver_text: String = self
                 .text(receiver)

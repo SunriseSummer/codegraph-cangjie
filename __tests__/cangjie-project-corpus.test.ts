@@ -119,13 +119,20 @@ describe.skipIf(!corpusAvailable)('Cangjie project-level boundary resolution', (
     }
   });
 
-  it('keeps colliding symbols bound to aliases, packages, and re-exports', async () => {
-    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cangjie-project-corpus-'));
-    copySourceTree(path.join(TEST_ROOT, 'codegraph-import-boundaries'), temporaryRoot);
-
+  const indexProject = async (name: string): Promise<CodeGraph> => {
+    graph?.destroy();
+    graph = undefined;
+    if (temporaryRoot) fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), `codegraph-cangjie-${name}-`));
+    copySourceTree(path.join(TEST_ROOT, name), temporaryRoot);
     graph = CodeGraph.initSync(temporaryRoot);
     await graph.indexAll();
     graph.resolveReferences();
+    return graph;
+  };
+
+  it('keeps colliding symbols bound to aliases, packages, and re-exports', async () => {
+    graph = await indexProject('codegraph-import-boundaries');
 
     const main = oneByQualifiedName(graph, 'codegraph_import_boundaries::main');
     const outgoing = graph.getOutgoingEdges(main.id).map((edge) => ({
@@ -165,5 +172,65 @@ describe.skipIf(!corpusAvailable)('Cangjie project-level boundary resolution', (
     expect(callsTarget(wildcard, 'codegraph_import_boundaries.other::makeLabel')).toBe(true);
     expect(callsTarget(qualified, 'codegraph_import_boundaries.library::makeLabel')).toBe(true);
     expect(callsTarget(reexport, 'codegraph_import_boundaries.library::makeLabel')).toBe(true);
+  }, 120_000);
+
+  it('resolves the executable feature matrix including overloads and extensions', async () => {
+    graph = await indexProject('codegraph-feature-matrix');
+    const main = oneByQualifiedName(graph, 'codegraph_feature_matrix::main');
+    const outgoing = graph.getOutgoingEdges(main.id);
+    const targetIds = new Set(outgoing.map((edge) => edge.target));
+    const targetQualifiedNames = new Set(
+      outgoing.map((edge) => graph!.getNode(edge.target)?.qualifiedName)
+    );
+
+    const renderOverloads = graph
+      .getNodesByName('render')
+      .filter((node) => node.qualifiedName === 'codegraph_feature_matrix::render');
+    expect(renderOverloads).toHaveLength(2);
+    for (const overload of renderOverloads) {
+      expect(targetIds.has(overload.id), overload.signature).toBe(true);
+    }
+    expect(targetQualifiedNames.has('codegraph_feature_matrix::Box::sizeHint')).toBe(true);
+    expect(targetQualifiedNames.has('codegraph_feature_matrix::apply')).toBe(true);
+    expect(targetQualifiedNames.has('codegraph_feature_matrix::Outcome::Success')).toBe(true);
+    expect(targetQualifiedNames.has('codegraph_feature_matrix::Outcome::Failure')).toBe(true);
+    expect(targetQualifiedNames.has('codegraph_feature_matrix::中文标识')).toBe(true);
+
+    const operators = graph
+      .getNodesByName('operator+')
+      .filter((node) => node.qualifiedName === 'codegraph_feature_matrix::Point::operator+');
+    expect(operators).toHaveLength(1);
+    expect(targetIds.has(operators[0]!.id)).toBe(true);
+
+    const inspectOptional = oneByQualifiedName(
+      graph,
+      'codegraph_feature_matrix::inspectOptional'
+    );
+    const optionalTargets = new Set(
+      graph
+        .getOutgoingEdges(inspectOptional.id)
+        .map((edge) => graph!.getNode(edge.target)?.qualifiedName)
+    );
+    expect(optionalTargets.has('codegraph_feature_matrix::Box::describe')).toBe(true);
+    expect(optionalTargets.has('codegraph_feature_matrix::Box::label')).toBe(true);
+  }, 120_000);
+
+  it('keeps calls inside spawn and synchronized bodies on their lexical owners', async () => {
+    graph = await indexProject('codegraph-concurrency');
+    const main = oneByQualifiedName(graph, 'codegraph_concurrency::main');
+    const topLevel = oneByQualifiedName(graph, 'codegraph_concurrency::addMany');
+    const method = oneByQualifiedName(graph, 'codegraph_concurrency::GuardedCounter::addMany');
+    const mainTargets = new Set(
+      graph.getOutgoingEdges(main.id).map((edge) => edge.target)
+    );
+    expect(mainTargets.has(topLevel.id)).toBe(true);
+    expect(mainTargets.has(method.id)).toBe(true);
+
+    const guardedMethodTargets = new Set(
+      graph
+        .getOutgoingEdges(method.id)
+        .map((edge) => graph!.getNode(edge.target)?.qualifiedName)
+    );
+    expect(guardedMethodTargets.has('codegraph_concurrency::addMany')).toBe(false);
   }, 120_000);
 });

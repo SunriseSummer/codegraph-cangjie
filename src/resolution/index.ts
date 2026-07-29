@@ -714,6 +714,7 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      candidates: ref.candidates,
       rowId: ref.rowId,
     }));
 
@@ -908,8 +909,14 @@ export class ReferenceResolver {
         ? ref.referenceName.slice(1)
         : ref.referenceName;
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
+    const cangjieCallableCandidate =
+      ref.language === 'cangjie' &&
+      ref.referenceKind === 'calls' &&
+      !ref.referenceName.includes('.') &&
+      this.hasAnyPossibleMatch('operator()');
     const preFilterPass =
       isNixPathImportRef(ref) ||
+      cangjieCallableCandidate ||
       this.hasAnyPossibleMatch(existenceName) ||
       this.matchesAnyImport(ref) ||
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
@@ -1094,7 +1101,13 @@ export class ReferenceResolver {
       // can: if `Foo` resolves to a class, the call IS an instantiation.
       if (kind === 'calls') {
         const targetNode = this.queries.getNodeById(ref.targetNodeId);
-        if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
+        if (
+          targetNode &&
+          (targetNode.kind === 'class' ||
+            targetNode.kind === 'struct' ||
+            (ref.original.language === 'cangjie' &&
+              targetNode.kind === 'enum_member'))
+        ) {
           kind = 'instantiates';
         }
       }
@@ -1120,6 +1133,9 @@ export class ReferenceResolver {
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
+          ...(ref.original.candidates?.length
+            ? { refCandidates: ref.original.candidates }
+            : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
           // tooling label "callback registration" and lets validation diff
@@ -1349,6 +1365,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -1469,6 +1486,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);

@@ -33,11 +33,54 @@ describe('Cangjie 1.0.5 extraction', () => {
     );
     expect(refs).toContain('extends:Base');
     expect(refs).toContain('implements:Renderable');
-    expect(refs).toContain('instantiates:Box');
+    expect(refs).toContain('calls:Box');
+    expect(refs).toContain('calls:Ok');
+    expect(refs).toContain('calls:consume');
+    expect(refs).not.toContain('calls:Ok.operator<');
     expect(refs).toContain('calls:box.render');
     expect(refs).toContain('calls:this.helper');
     expect(refs).toContain('references:box.label');
     expect(refs.filter((ref) => ref === 'calls:box.render')).toHaveLength(2);
     expect(refs.filter((ref) => ref === 'references:box.label')).toHaveLength(2);
+
+    const calls = result.unresolvedReferences.filter(
+      (ref) => ref.referenceKind === 'calls'
+    );
+    expect(
+      calls
+        .filter((ref) => ref.referenceName === 'format')
+        .map((ref) => ref.candidates)
+    ).toEqual([
+      ['@cangjie/arity=1', '@cangjie/type:0=Int64'],
+      [
+        '@cangjie/arity=2',
+        '@cangjie/type:0=Int64',
+        '@cangjie/label:1=radix',
+        '@cangjie/type:1=Int64',
+      ],
+      ['@cangjie/arity=1', '@cangjie/type:0=String'],
+    ]);
+    expect(
+      calls.find((ref) => ref.referenceName === 'route')?.candidates
+    ).toEqual([
+      '@cangjie/arity=2',
+      '@cangjie/type:0=Bool',
+      '@cangjie/type:1=Function',
+    ]);
+    expect(
+      calls
+        .filter((ref) => ref.referenceName === 'selector.operator+')
+        .map((ref) => ref.candidates)
+    ).toEqual([
+      ['@cangjie/arity=1', '@cangjie/type:0=Int64'],
+      ['@cangjie/arity=1', '@cangjie/type:0=String'],
+    ]);
+    expect(
+      result.unresolvedReferences.find(
+        (ref) =>
+          ref.referenceKind === 'calls' &&
+          ref.referenceName === 'Ok'
+      )?.candidates
+    ).toEqual(['@cangjie/arity=1', '@cangjie/type:0=String']);
   });
 });
