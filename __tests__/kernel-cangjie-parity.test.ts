@@ -25,6 +25,25 @@ const FIXTURE = path.join(__dirname, 'fixtures', 'kernel-parity', 'torture.cj');
 const kernelBuilt = fs.existsSync(KERNEL_PATH);
 const ENV_KEYS = ['CODEGRAPH_KERNEL', 'CODEGRAPH_KERNEL_LANGS'] as const;
 let savedEnv: Record<string, string | undefined>;
+const UNIT_TEST_SOURCE = `package parity.tests
+
+@Skip
+@Test[value in [1, 2]]
+func parameterized(value: Int64): Unit {
+    @Expect(value, value)
+}
+
+@Test
+class ExampleTests {
+    @BeforeEach
+    func setUp(): Unit {}
+
+    @TestCase
+    func example(): Unit {
+        @Expect(1, 1)
+    }
+}
+`;
 
 function canon(result: ExtractionResult): {
   nodes: string[];
@@ -88,5 +107,26 @@ describe.skipIf(!kernelBuilt)('kernel Cangjie extraction parity', () => {
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
     expect(tryKernelExtract('broken.cj', 'class Broken { func f(', 'cangjie')).toBeNull();
+  });
+
+  it('matches Cangjie unit-test annotations and macro bodies', () => {
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    const native = tryKernelExtract('src/example_test.cj', UNIT_TEST_SOURCE, 'cangjie');
+    expect(native).not.toBeNull();
+
+    process.env.CODEGRAPH_KERNEL = '0';
+    const wasm = extractFromSource('src/example_test.cj', UNIT_TEST_SOURCE, 'cangjie');
+    delete process.env.CODEGRAPH_KERNEL;
+
+    expect(canon(native!)).toEqual(canon(wasm));
+    expect(
+      native!.nodes.find((node) => node.qualifiedName === 'parity.tests::parameterized')
+        ?.decorators
+    ).toEqual(['Skip', 'Test']);
+    expect(
+      native!.nodes.find((node) => node.qualifiedName === 'parity.tests::ExampleTests::example')
+        ?.decorators
+    ).toEqual(['TestCase']);
   });
 });

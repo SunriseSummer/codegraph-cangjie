@@ -10,6 +10,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 
+## [1.5.0-cangjie-1.0.5.3] - 2026-07-29
+
+### Fixed
+
+- Prevented incremental sync from retargeting a call to a same-named, same-signature member on a different interface or implementation type after a callee-file edit.
+- Recognized Cangjie's official `*_test.cj` convention in affected-test and MCP blast-radius results without misclassifying examples and fixtures as runnable tests.
+- Preserved Cangjie unit-test macros such as `@Test`, `@TestCase`, lifecycle hooks and parameterized-test annotations in both native-kernel and WASM extraction, and exposed them in MCP node details.
+
+
 ## [1.5.0-cangjie-1.0.5.2] - 2026-07-29
 
 ### Fixed
@@ -736,3 +745,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.5.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.5.0
 [1.5.0-cangjie-1.0.5.1]: https://github.com/SunriseSummer/codegraph-cangjie/releases/tag/v1.5.0-cangjie-1.0.5.1
 [1.5.0-cangjie-1.0.5.2]: https://github.com/SunriseSummer/codegraph-cangjie/releases/tag/v1.5.0-cangjie-1.0.5.2
+[1.5.0-cangjie-1.0.5.3]: https://github.com/SunriseSummer/codegraph-cangjie/releases/tag/v1.5.0-cangjie-1.0.5.3

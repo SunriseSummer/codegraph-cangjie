@@ -10,7 +10,7 @@
  * `manifest.kt` / a `RealCall.kt` production file must NOT be flagged.
  */
 import { describe, it, expect } from 'vitest';
-import { isTestFile } from '../src/search/query-utils';
+import { isTestFile, isTestSourceFile } from '../src/search/query-utils';
 
 describe('isTestFile', () => {
   it('flags Kotlin test files and source sets', () => {
@@ -34,6 +34,23 @@ describe('isTestFile', () => {
     expect(isTestFile('com/example/FooTestCase.java')).toBe(true);
     expect(isTestFile('project/__tests__/foo.ts')).toBe(true);
     expect(isTestFile('project/tests/foo.rb')).toBe(true);
+    expect(isTestFile('project/e2e/login.ts')).toBe(true);
+  });
+
+  it('flags standard Cangjie unit-test files without misclassifying production files', () => {
+    expect(isTestFile('src/math_test.cj')).toBe(true);
+    expect(isTestSourceFile('src/math_test.cj')).toBe(true);
+    expect(isTestFile('src/widgets/render_test.cj')).toBe(true);
+    expect(isTestFile('src/math.cj')).toBe(false);
+    expect(isTestFile('src/latest_value.cj')).toBe(false);
+  });
+
+  it('keeps strict affected-test detection separate from search deprioritization', () => {
+    expect(isTestFile('examples/src/demo.cj')).toBe(true);
+    expect(isTestSourceFile('examples/src/demo.cj')).toBe(false);
+    expect(isTestFile('fixtures/sample.ts')).toBe(true);
+    expect(isTestSourceFile('fixtures/sample.ts')).toBe(false);
+    expect(isTestSourceFile('e2e/login.ts')).toBe(true);
   });
 
   it('does NOT flag production files that merely contain "test" lowercase', () => {

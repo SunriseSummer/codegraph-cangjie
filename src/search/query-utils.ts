@@ -275,9 +275,14 @@ export function scorePathRelevance(
 }
 
 /**
- * Check if a file path looks like a test file
+ * Check whether a path follows an actual test-source convention.
+ *
+ * This deliberately excludes broader non-production locations such as
+ * examples/fixtures/benchmarks. Use it for affected-test selection and for
+ * user-facing "covering tests" claims, where calling an example a test would
+ * be misleading.
  */
-export function isTestFile(filePath: string): boolean {
+export function isTestSourceFile(filePath: string): boolean {
   const lower = filePath.toLowerCase();
   const fileName = path.basename(filePath);   // original case — needed for camelCase boundaries
   const lowerName = fileName.toLowerCase();
@@ -301,9 +306,10 @@ export function isTestFile(filePath: string): boolean {
     lower.includes('/tests/') || lower.includes('/test/') ||
     lower.includes('/__tests__/') || lower.includes('/spec/') ||
     lower.includes('/specs/') || lower.includes('/testlib/') ||
-    lower.includes('/testing/') ||
+    lower.includes('/testing/') || lower.includes('/e2e/') ||
     lower.startsWith('test/') || lower.startsWith('tests/') ||
     lower.startsWith('spec/') || lower.startsWith('specs/') ||
+    lower.startsWith('e2e/') ||
     // CamelCase test source-set dirs (Kotlin Multiplatform / Gradle / Xcode):
     // jvmTest/, commonTest/, androidTest/, iosTest/, integrationTest/. Capital-led
     // so "latest/" / "manifest/" are not matched.
@@ -311,6 +317,20 @@ export function isTestFile(filePath: string): boolean {
   ) {
     return true;
   }
+
+  return false;
+}
+
+/**
+ * Check if a file path looks like test or otherwise non-production code.
+ *
+ * Search/context ranking intentionally treats examples, fixtures, benchmarks,
+ * and demos like tests so they do not displace production definitions. Code
+ * that must identify runnable tests should use {@link isTestSourceFile}.
+ */
+export function isTestFile(filePath: string): boolean {
+  if (isTestSourceFile(filePath)) return true;
+  const lower = filePath.toLowerCase();
 
   // Non-production directories: examples, samples, benchmarks, fixtures, demos.
   // Check both mid-path (/integration/) and start-of-path (integration/) since

@@ -1828,15 +1828,16 @@ export class QueryBuilder {
    * caller can re-resolve the edge to the re-indexed target's new ID (node IDs
    * are `sha256(filePath:kind:name:line)`, so any line shift in the callee file
    * changes target IDs and a naive re-insert by old ID silently drops them).
-   * Used by `storeExtractionResult` to preserve incoming edges across a file
-   * re-index (issue #899). Same edge-kind rules as
-   * {@link getDependentFilePaths}: all kinds except `contains`.
+   * Reattachment uses the container-aware qualified name plus signature (not
+   * the simple name, which collides across types) to preserve incoming edges
+   * during `storeExtractionResult` re-indexing (issue #899). Same edge-kind
+   * rules as {@link getDependentFilePaths}: all kinds except `contains`.
    */
   getCrossFileIncomingEdgesWithTarget(
     filePath: string
-  ): Array<Edge & { targetName: string; targetKind: NodeKind; targetSignature?: string; sourceFilePath: string; sourceLanguage: Language }> {
-    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind,
-        tgt.signature AS target_signature,
+  ): Array<Edge & { targetKind: NodeKind; targetQualifiedName: string; targetSignature?: string; sourceFilePath: string; sourceLanguage: Language }> {
+    const sql = `SELECT e.*, tgt.kind AS target_kind,
+        tgt.qualified_name AS target_qualified_name, tgt.signature AS target_signature,
         src.file_path AS source_file_path, src.language AS source_language
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
@@ -1845,12 +1846,12 @@ export class QueryBuilder {
         AND e.kind != 'contains'
         AND src.file_path != ?`;
     const rows = this.db.prepare(sql).all(filePath, filePath) as Array<
-      EdgeRow & { target_name: string; target_kind: NodeKind; target_signature: string | null; source_file_path: string; source_language: Language }
+      EdgeRow & { target_kind: NodeKind; target_qualified_name: string; target_signature: string | null; source_file_path: string; source_language: Language }
     >;
     return rows.map(row => ({
       ...rowToEdge(row),
-      targetName: row.target_name,
       targetKind: row.target_kind,
+      targetQualifiedName: row.target_qualified_name,
       ...(row.target_signature ? { targetSignature: row.target_signature } : {}),
       sourceFilePath: row.source_file_path,
       sourceLanguage: row.source_language,

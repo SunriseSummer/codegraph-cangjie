@@ -41,6 +41,50 @@ function modifierText(node: SyntaxNode): string {
   return childOfType(node, 'modifiers')?.text ?? '';
 }
 
+/**
+ * Cangjie annotations are macros in the grammar, so declaration annotations
+ * such as `@Test`, `@TestCase`, `@BeforeEach`, and parameterized `@Test[...]`
+ * appear as `macroExpression` siblings immediately before the declaration.
+ * Preserve their names on the graph node's decorators list so tools can tell
+ * a test function/class/case from an ordinary helper in the same `_test.cj`.
+ */
+function declarationMacroNames(node: SyntaxNode): string[] | undefined {
+  const names: string[] = [];
+  const nameOf = (macro: SyntaxNode): string | undefined => {
+    const name = childOfType(macro, 'macroName');
+    const text = name?.text.trim();
+    return text || undefined;
+  };
+
+  // Be tolerant of grammar variants that attach macro attributes directly.
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child?.type !== 'macroExpression') continue;
+    const name = nameOf(child);
+    if (name) names.push(name);
+  }
+
+  const parent = node.parent;
+  if (parent) {
+    let declarationIndex = -1;
+    for (let i = 0; i < parent.namedChildCount; i++) {
+      const sibling = parent.namedChild(i);
+      if (sibling?.startIndex === node.startIndex) {
+        declarationIndex = i;
+        break;
+      }
+    }
+    for (let i = declarationIndex - 1; i >= 0; i--) {
+      const sibling = parent.namedChild(i);
+      if (!sibling || sibling.type !== 'macroExpression') break;
+      const name = nameOf(sibling);
+      if (name) names.unshift(name);
+    }
+  }
+
+  return names.length > 0 ? [...new Set(names)] : undefined;
+}
+
 function enclosingTypeDefinition(node: SyntaxNode): SyntaxNode | null {
   let current = node.parent;
   while (current) {
@@ -314,6 +358,7 @@ export const cangjieExtractor: LanguageExtractor = {
   isExported: (node) => cangjieVisibility(node) === 'public',
   isStatic: (node) => node.type === 'staticInit' || /\bstatic\b/.test(modifierText(node)),
   isConst: (node) => hasKeywordToken(node, 'let') || hasKeywordToken(node, 'const'),
+  extractModifiers: declarationMacroNames,
 
   getReturnType: (node, source) => {
     const returnType = childOfType(node, 'returnType');

@@ -22,7 +22,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isTestSourceFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
   readFileSync,
@@ -2393,8 +2393,8 @@ export class ToolHandler {
       if (uniq.length === 0) continue; // no blast radius → nothing to flag
 
       const callerFiles = [...new Set(uniq.map((n) => rel(n.filePath)))];
-      const testFiles = callerFiles.filter((f) => isTestFile(f));
-      const nonTest = callerFiles.filter((f) => !isTestFile(f));
+      const testFiles = callerFiles.filter((f) => isTestSourceFile(f));
+      const nonTest = callerFiles.filter((f) => !isTestSourceFile(f));
 
       const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
       const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
@@ -4660,7 +4660,10 @@ export class ToolHandler {
     for (const c of children) {
       const loc = c.startLine ? `:${c.startLine}` : '';
       const sig = c.signature ? ` — \`${c.signature}\`` : '';
-      lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
+      const decorators = c.decorators?.length
+        ? ` — ${c.decorators.map((decorator) => `@${decorator}`).join(', ')}`
+        : '';
+      lines.push(`- ${c.name} (${c.kind})${loc}${sig}${decorators}`);
     }
     return lines.join('\n');
   }
@@ -4675,6 +4678,9 @@ export class ToolHandler {
 
     if (node.signature) {
       lines.push(`**Signature:** \`${node.signature}\``);
+    }
+    if (node.decorators?.length) {
+      lines.push(`**Decorators:** ${node.decorators.map((decorator) => `@${decorator}`).join(', ')}`);
     }
 
     // Only include docstring if it's short and useful

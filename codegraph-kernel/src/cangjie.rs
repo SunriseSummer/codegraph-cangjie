@@ -226,6 +226,35 @@ impl<'t> Walker<'t> {
             .unwrap_or("")
     }
 
+    /// Cangjie declaration annotations are parsed as `macroExpression`
+    /// siblings (`@Test`, `@TestCase`, lifecycle macros, parameterized tests).
+    /// Keep the macro names on the declaration node so native extraction
+    /// matches the WASM extractor's `extractModifiers` hook.
+    fn declaration_macro_names(&self, node: Node<'t>) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut previous = node.prev_named_sibling();
+        while let Some(macro_node) = previous {
+            if macro_node.kind() != "macroExpression" {
+                break;
+            }
+            if let Some(name_node) = self.first_direct_kind(macro_node, &["macroName"]) {
+                let name = self.text(name_node).trim();
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+            previous = macro_node.prev_named_sibling();
+        }
+        names.reverse();
+        let mut unique_names = Vec::new();
+        for name in names {
+            if !unique_names.contains(&name) {
+                unique_names.push(name);
+            }
+        }
+        unique_names
+    }
+
     fn visibility_of(&self, node: Node) -> u8 {
         let modifiers = self.modifier_text(node);
         if modifiers
@@ -433,7 +462,7 @@ impl<'t> Walker<'t> {
                         .split_whitespace()
                         .any(|part| part == "static")
             }),
-            decorators: Vec::new(),
+            decorators: self.declaration_macro_names(node),
             type_parameters: self.declaration_type_parameters(node),
             return_type: self.return_type_of(node),
         }

@@ -2290,12 +2290,14 @@ export class ExtractionOrchestrator {
     // `references` edges from callers that import it via module-attribute
     // access (`pkg.mod.fn(...)`).
     //
-    // We snapshot the edge plus the target node's (name, kind) so we can
-    // re-resolve to the re-indexed target's NEW id. Node ids are
+    // We snapshot the edge plus the target node's container-aware identity so
+    // we can re-resolve to the re-indexed target's NEW id. Node ids are
     // `sha256(filePath:kind:name:line)`, so any line shift in the callee file
     // (e.g. a docstring-only edit above the symbol) changes every target id and
     // a naive re-insert by old id would silently drop every edge. Matching by
-    // (filePath, kind, name) is stable across line shifts; if the symbol was
+    // (filePath, kind, qualifiedName, signature) is stable across line shifts;
+    // unlike a simple name it also distinguishes same-signature members on
+    // different types in one file. If the symbol was
     // renamed/removed, no match is found and the edge stays dropped (correct).
     const crossFileIncomingEdges = existingFile
       ? this.queries.getCrossFileIncomingEdgesWithTarget(filePath)
@@ -2370,10 +2372,11 @@ export class ExtractionOrchestrator {
 
     // Re-insert cross-file incoming edges snapshotted before the delete,
     // re-resolving each edge's target to the re-indexed node's new id by
-    // (filePath, kind, name). Node ids include the source line, so any line
-    // shift in the callee file (e.g. a docstring-only edit above the symbol)
-    // changes every target id and a naive re-insert by old id would drop them
-    // all. `insertEdges` still filters to endpoints that exist. This closes
+    // (filePath, kind, qualifiedName, signature). Node ids include the source
+    // line, so any line shift in the callee file (e.g. a docstring-only edit
+    // above the symbol) changes every target id and a naive re-insert by old id
+    // would drop them all. `insertEdges` still filters to endpoints that exist.
+    // This closes
     // the #899 edge-drop on `sync`.
     //
     // Edges whose callee (target) was renamed/removed during the re-index (no
@@ -2454,23 +2457,33 @@ export class ExtractionOrchestrator {
   /**
    * Re-attach cross-file incoming edges snapshotted before a re-index delete
    * (#899): re-resolve each edge's target to the re-indexed node's new id by
-   * (kind, name); targets that vanished are resurrected as their original
-   * unresolved ref (#1240's removal-side counterpart) when the edge carries
-   * its refName stamp.
+   * (kind, qualifiedName, signature). Targets that vanished are resurrected as
+   * their original unresolved ref (#1240's removal-side counterpart) when the
+   * edge carries its refName stamp.
    */
   private reattachCrossFileEdges(
-    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetName: string; targetSignature?: string; sourceFilePath: string; sourceLanguage: Language }>,
+    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetQualifiedName: string; targetSignature?: string; sourceFilePath: string; sourceLanguage: Language }>,
     validNodes: Node[]
   ): void {
     const newNodesByIdentity = new Map<string, string>();
     for (const n of validNodes) {
-      newNodesByIdentity.set(`${n.kind}\0${n.name}\0${n.signature ?? ''}`, n.id);
+      // A file may contain several same-signature members with the same simple
+      // name (for example `Interface::describe` and `Box::describe`). Matching
+      // only (kind, name, signature) made the later declaration overwrite the
+      // earlier Map entry, so an unrelated callee-file edit could silently
+      // retarget an unchanged caller to the wrong owning type. qualifiedName
+      // is the stable container-aware identity; signature still distinguishes
+      // overloads within that container.
+      newNodesByIdentity.set(
+        `${n.kind}\0${n.qualifiedName}\0${n.signature ?? ''}`,
+        n.id
+      );
     }
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
       const newTargetId = newNodesByIdentity.get(
-        `${e.targetKind}\0${e.targetName}\0${e.targetSignature ?? ''}`
+        `${e.targetKind}\0${e.targetQualifiedName}\0${e.targetSignature ?? ''}`
       );
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
