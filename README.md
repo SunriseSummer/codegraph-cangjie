@@ -1,6 +1,6 @@
 # CodeGraph + Cangjie Support
 
-本项目在 [CodeGraph](https://github.com/colbymchenry/codegraph) 上扩展支持仓颉编程语言，可用于中大型仓颉项目的 AI Coding 提效，CodeGraph 项目介绍和使用指南请参阅官方文档：
+本项目在 [CodeGraph](https://github.com/colbymchenry/codegraph) 上扩展支持[仓颉编程语言](https://cangjie-lang.cn/)，可用于中大型仓颉项目的 AI Coding 提效，CodeGraph 项目介绍和使用指南请参阅官方文档：
 
 - [项目介绍](https://github.com/colbymchenry/codegraph/tree/v1.5.0)
 - [使用指南](https://colbymchenry.github.io/codegraph/)
