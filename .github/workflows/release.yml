@@ -44,7 +44,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          # The macos-15 ARM pool can fail to provision a runner. The Intel
+          # image cross-compiles both Darwin targets.
+          - runner: macos-15-intel
             targets: aarch64-apple-darwin x86_64-apple-darwin
           - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
             targets: x86_64-unknown-linux-gnu
@@ -170,6 +172,19 @@ jobs:
           done
           ls -lh release
 
+      - name: Stage npm packages and smoke-test an actual installation
+        run: |
+          set -euo pipefail
+          bash scripts/pack-npm.sh "${{ steps.ver.outputs.version }}"
+          CHECK_DIR="$RUNNER_TEMP/codegraph-package-check"
+          mkdir -p "$CHECK_DIR/tarballs"
+          npm pack ./release/npm/main --pack-destination "$CHECK_DIR/tarballs" --silent
+          npm pack ./release/npm/codegraph-linux-x64 --pack-destination "$CHECK_DIR/tarballs" --silent
+          npm install --prefix "$CHECK_DIR/install" --ignore-scripts \
+            --registry=https://registry.npmjs.org "$CHECK_DIR"/tarballs/*.tgz
+          node scripts/smoke-release-package.cjs \
+            "$CHECK_DIR/install/node_modules/@cangjie-lang/codegraph" "$GITHUB_WORKSPACE"
+
       - name: Generate SHA256SUMS
         # Published as a release asset; the npm launcher verifies downloaded
         # bundles against it (basenames only, so its path.basename match works).
@@ -222,7 +237,6 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ steps.ver.outputs.version }}"
-          bash scripts/pack-npm.sh "$V"
 
           # Refuse to publish if the generator emits a surprising package name,
           # version, registry, repository, or package count.

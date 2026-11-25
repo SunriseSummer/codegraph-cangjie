@@ -69,7 +69,10 @@ CANGJIE_TEST_TOOLCHAIN=1 CODEGRAPH_KERNEL_EXPECT=1 npm test -- --maxWorkers=4
 
 The release workflow runs the Cangjie suites on each kernel runner, then the
 complete suite with the Linux native kernel and compiler checks before building
-or publishing release assets. A failing test blocks publication.
+or publishing release assets. It then packs and installs the main/Linux npm
+tarballs and verifies the shipped CLI, SDK, Cangjie indexing/sync, native kernel,
+viewer assets and MCP initialization/tool invocation. A failing test blocks
+publication.
 
 SDK source: [official 1.0.6 download page](https://cangjie-lang.cn/download/1.0.6).  
 Linux x64 archive SHA-256:

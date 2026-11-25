@@ -22,6 +22,6 @@ codegraph --version
 
 升级后，请在已索引的项目目录运行 `codegraph index` 重建索引，以启用新版提取和引用解析修复。支持 `.cj` 文件、包和导入别名、类/接口/结构体/枚举、扩展、重载与运算符、测试标注、CLI、MCP 和 Web 查看器；原生 Rust 与 WASM 两条解析路径均保留仓颉支持。
 
-本版本补充了常量/函数值依赖、递归及局部回调遮蔽修复，并增加语言特性矩阵、真实编译运行和多包增量同步回归测试，详见[适配与测试说明](docs/cangjie-1.0.6-validation.md)。
+本版本补充了常量/函数值依赖、递归及局部回调遮蔽修复，并增加语言特性矩阵、真实编译运行和多包增量同步回归测试，详见[适配与测试说明](https://github.com/SunriseSummer/codegraph-cangjie/blob/cangjie-1.0.6/docs/cangjie-1.0.6-validation.md)。
 
 <img width="1055" height="1491" alt="CodeGraph" src="https://github.com/user-attachments/assets/527efc05-01a0-4eed-a733-b170f9074f0f" />
