@@ -1,5 +1,5 @@
 /**
- * Cangjie 1.0.5 native↔WASM extraction parity.
+ * Cangjie 1.0.6 native↔WASM extraction parity.
  *
  * The native grammar and the vendored WASM are generated from the same
  * parser/scanner sources. This test additionally pins semantic parity for the
@@ -101,6 +101,12 @@ describe.skipIf(!kernelBuilt)('kernel Cangjie extraction parity', () => {
 
       expect(canon(native!), `${name}: native/WASM parity`).toEqual(canon(wasm));
     }
+  });
+
+  it('cancels a native Cangjie parse when its deadline expires', () => {
+    const kernel = require(KERNEL_PATH) as { extractFile: (file: string, source: string, language: string, budgetMs: number) => unknown };
+    const source = `package budget\n${'func probe(): Int64 { 1 }\n'.repeat(5_000)}`;
+    expect(() => kernel.extractFile('budget.cj', source, 'cangjie', 0)).toThrow(/timeout:/);
   });
 
   it('defers malformed files to the WASM recovery path', () => {

@@ -6,7 +6,7 @@
 # GitHub Releases. No Node.js, no build tools, no npm required — ideal for a
 # fresh Linux VPS over SSH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SunriseSummer/codegraph-cangjie/cangjie-1.0.5/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/SunriseSummer/codegraph-cangjie/cangjie-1.0.6/install.sh | sh
 #
 # Upgrade:   run `codegraph upgrade` (or just re-run the same command).
 # Uninstall: curl -fsSL .../install.sh | sh -s -- --uninstall
@@ -34,6 +34,11 @@ arch="$(uname -m)"
 case "$os" in
   Darwin) os="darwin" ;;
   Linux)  os="linux" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    echo "codegraph: on Windows, open PowerShell and run:" >&2
+    echo "  irm https://raw.githubusercontent.com/SunriseSummer/codegraph-cangjie/cangjie-1.0.6/install.ps1 | iex" >&2
+    exit 1
+    ;;
   *) echo "codegraph: unsupported OS '$os'." >&2; exit 1 ;;
 esac
 case "$arch" in

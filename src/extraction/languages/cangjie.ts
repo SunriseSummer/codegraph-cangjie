@@ -3,7 +3,7 @@ import { getNodeText, getPrecedingDocstring } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
 /**
- * Cangjie 1.0.5 extraction.
+ * Cangjie 1.0.6 extraction.
  *
  * The bundled grammar exposes dedicated name/body child kinds
  * (`funcName`, `classBody`, …) in addition to stable `name` fields. The
@@ -35,6 +35,71 @@ function collectBindingNames(node: SyntaxNode, source: string): string[] {
   };
   walk(node);
   return names;
+}
+
+/** Whether a value name is shadowed at this exact lexical use site. */
+export type CangjieBlockBindings = Map<number, Map<string, number>>;
+
+export function cangjieHasLocalValueBinding(node: SyntaxNode, source: string, name: string, blocks: CangjieBlockBindings = new Map()): boolean {
+  const binds = (pattern: SyntaxNode | null | undefined): boolean =>
+    !!pattern && collectBindingNames(pattern, source).includes(name);
+  let child = node;
+  let parent = node.parent;
+  let budget = 10_000;
+  while (parent && budget-- > 0) {
+    if (parent.type === 'block') {
+      let declarations = blocks.get(parent.startIndex);
+      if (!declarations) {
+        declarations = new Map();
+        for (const sibling of parent.namedChildren) {
+          if (sibling.type !== 'variableDeclaration') continue;
+          const pattern = sibling.childForFieldName('name');
+          if (!pattern) continue;
+          for (const bound of collectBindingNames(pattern, source)) {
+            if (!declarations.has(bound)) declarations.set(bound, sibling.startIndex);
+          }
+        }
+        blocks.set(parent.startIndex, declarations);
+      }
+      const declaration = declarations.get(name);
+      if (declaration !== undefined && declaration <= node.startIndex) return true;
+    }
+    const parameters = parent.namedChildren.find(n => n.type === 'parameterList' || n.type === 'primaryInitParamList');
+    if (parameters) {
+      const pending = [...parameters.namedChildren];
+      while (pending.length && budget-- > 0) {
+        const parameter = pending.pop()!;
+        const identifier = parameter.childForFieldName('paraName');
+        if (identifier && getNodeText(identifier, source) === name) return true;
+        if (!identifier) pending.push(...parameter.namedChildren);
+      }
+    }
+    if (parent.type === 'lambdaExpression' && binds(childOfType(parent, 'lambdaParameters'))) return true;
+    if (parent.type === 'forInExpression' && child.type === 'block' && binds(parent.namedChild(0))) return true;
+    if (parent.type === 'matchCase') {
+      const pattern = parent.namedChild(0);
+      if (pattern && node.startIndex >= pattern.endIndex && binds(pattern)) return true;
+    }
+    if (parent.type === 'ifExpression' && child.type === 'block') {
+      const pattern = parent.namedChild(0);
+      if (pattern && /Pattern$/.test(pattern.type) && binds(pattern)) return true;
+    }
+    if (parent.type === 'tryExpression' && child.previousNamedSibling?.type === 'catchPattern' && binds(child.previousNamedSibling)) return true;
+    child = parent;
+    parent = parent.parent;
+  }
+  // A pathological tree must not turn an incomplete scope check into a guess.
+  return budget <= 0;
+}
+
+/** Bare value reads, excluding call heads, qualified members and local bindings. */
+export function cangjieValueReferenceName(node: SyntaxNode, source: string, blocks?: CangjieBlockBindings): string | null {
+  if (node.type !== 'atomicVariable' || node.parent?.type === 'fieldAccess') return null;
+  if (node.parent?.type === 'postfixExpression' && node.nextNamedSibling) return null;
+  const binding = childOfType(node, 'varBindingPattern', 'identifier');
+  const name = binding ? getNodeText(binding, source).trim() : '';
+  if (!name || name === '_' || cangjieHasLocalValueBinding(node, source, name, blocks)) return null;
+  return name;
 }
 
 function modifierText(node: SyntaxNode): string {

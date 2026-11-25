@@ -86,6 +86,45 @@ int dispatch(struct ops o) { return o.handler(); }
     expect(edges.every((e) => e.via === 'ops.handler')).toBe(true);
   });
 
+  it('bridges function-pointer fields declared in a union', async () => {
+    write('union-ops.c', `
+union ops { int (*handler)(void); };
+static int on_open(void) { return 1; }
+static union ops the_ops = { .handler = on_open };
+
+int dispatch(union ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+    expect(edges.every((e) => e.via === 'ops.handler')).toBe(true);
+  });
+
+  it('bridges an inline union table whose entries are macro-built', async () => {
+    write('inline-union.c', `
+#define SLOT(fn) { fn }
+static int on_open(void) { return 1; }
+static union inline_ops { int (*handler)(void); } ops[] = { SLOT(on_open) };
+
+int dispatch(union inline_ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+  });
+
+  it('bridges a union table declared through an object-macro type alias', async () => {
+    write('alias-union.c', `
+#define OPS_TYPE union ops
+#define SLOT(fn) { fn }
+union ops { int (*handler)(void); };
+static int on_open(void) { return 1; }
+static OPS_TYPE ops[] = { SLOT(on_open) };
+
+int dispatch(union ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+  });
+
   it('bridges the typedef-field + field←field double-hop (the hook_demo.c shape)', async () => {
     write('hook.c', `
 typedef void (*hook_func)(void);
@@ -138,6 +177,29 @@ int total(struct box *x) { return x->count + 1; }
     const edges = await load();
     // No indirect dispatch happens, so there are no synthesized edges at all.
     expect(edges.length).toBe(0);
+  });
+
+  it('links registrations only to C/C++ functions, never a same-named function in another language', async () => {
+    write('ops.h', `struct ops { int (*read)(int); int (*probe)(int); };\n`);
+    write('impl.c', `int impl_read(int fd) { return fd; }\n`);
+    write('ops.c', `
+#include "ops.h"
+int impl_read(int fd);
+static struct ops the_ops = { .read = impl_read, .probe = gen_probe };
+int use(struct ops *o, int fd) { return o->read(fd) + o->probe(fd); }
+`);
+    write('aaa/gen.py', `def impl_read():\n    return 1\n\ndef gen_probe():\n    return 2\n`);
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const rows: { tgt: string; file: string }[] = (cg as any).db.db
+      .prepare(
+        `SELECT t.name tgt, t.file_path file FROM edges e JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'fn-pointer-dispatch'`
+      )
+      .all();
+    cg.close?.();
+    expect(rows.filter((r) => r.tgt === 'impl_read').map((r) => r.file)).toEqual(['impl.c']);
+    expect(rows.some((r) => r.file.endsWith('.py'))).toBe(false);
   });
 
   it('is a no-op on a project with no C/C++ (clean control)', async () => {

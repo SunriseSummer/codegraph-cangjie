@@ -16,6 +16,18 @@ import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
 import { antigravityTarget } from './antigravity';
 import { kiroTarget } from './kiro';
+import { copilotVscodeTarget } from './copilot-vscode';
+import { copilotCliTarget } from './copilot-cli';
+import { copilotJetbrainsTarget } from './copilot-jetbrains';
+import { bobTarget } from './bob';
+import { droidTarget } from './droid';
+import { windsurfTarget } from './windsurf';
+import { qwenTarget } from './qwen';
+import { dshTarget } from './dsh';
+import { grokTarget } from './grok';
+import { kimiTarget } from './kimi';
+import { qoderTarget } from './qoder';
+import { piTarget } from './pi';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
@@ -26,6 +38,18 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   geminiTarget,
   antigravityTarget,
   kiroTarget,
+  copilotVscodeTarget,
+  copilotCliTarget,
+  copilotJetbrainsTarget,
+  bobTarget,
+  droidTarget,
+  windsurfTarget,
+  qwenTarget,
+  dshTarget,
+  grokTarget,
+  kimiTarget,
+  qoderTarget,
+  piTarget,
 ]);
 
 export function getTarget(id: string): AgentTarget | undefined {

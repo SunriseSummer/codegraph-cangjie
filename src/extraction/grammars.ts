@@ -7,9 +7,10 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
-import { Language } from '../types';
+import { ExtractionError, Language } from '../types';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -175,6 +176,67 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cj': 'cangjie',
 };
 
+/** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
+const MPEG_TS_PACKET_SIZE = 188;
+const MPEG_TS_SYNC_BYTE = 0x47;
+/**
+ * Consecutive packets whose sync byte must line up before a file counts as
+ * video — 3 KB of head. A stream shorter than that is cheap to parse anyway;
+ * the cost #1910 is about comes from clips hundreds of KB long.
+ */
+const MPEG_TS_MIN_PACKETS = 16;
+/**
+ * Share of the head that must be control bytes (below 0x20, other than the
+ * whitespace ones) for it to count as binary. Compressed audio and video put
+ * about one byte in eight there; source text puts none.
+ */
+const MPEG_TS_MIN_CONTROL_SHARE = 1 / 64;
+/**
+ * How many bytes of a file's head `isMpegTransportStream` needs — enough to
+ * see `MPEG_TS_MIN_PACKETS` sync bytes plus the packets between them.
+ */
+export const MPEG_TS_SNIFF_BYTES = MPEG_TS_PACKET_SIZE * MPEG_TS_MIN_PACKETS;
+
+/**
+ * Whether these leading bytes are an MPEG transport stream — the OTHER thing a
+ * `.ts` file can be. Golden video fixtures (`testdata/*.ts`, e2e clips) share
+ * TypeScript's extension, and tree-sitter takes ~28 s to chew through a 900 KB
+ * clip for zero symbols (#1910), so the decision has to be made from the head
+ * of the file, before any parse.
+ *
+ * Two conditions, both required:
+ *   1. the sync byte 0x47 sits at every 188-byte packet boundary of the first
+ *      `MPEG_TS_MIN_PACKETS` packets — every packet of a transport stream
+ *      opens with it, and nothing else pads to 188;
+ *   2. the head is binary: at least `MPEG_TS_MIN_CONTROL_SHARE` of it is
+ *      control bytes, as any compressed payload is.
+ * 0x47 is the letter `G`, so (1) alone could match source whose lines happen
+ * to put a `G` at every 188-byte stride. Checking for a single NUL was not
+ * enough to close that: one NUL in a comment is still TypeScript. (2) asks for
+ * dozens of control bytes, which no source file carries.
+ *
+ * `head` is the first `MPEG_TS_SNIFF_BYTES` (or fewer) bytes of the file.
+ */
+export function isMpegTransportStream(head: Uint8Array): boolean {
+  const lastSync = MPEG_TS_PACKET_SIZE * (MPEG_TS_MIN_PACKETS - 1);
+  if (head.length <= lastSync) return false;
+  for (let off = 0; off <= lastSync; off += MPEG_TS_PACKET_SIZE) {
+    if (head[off] !== MPEG_TS_SYNC_BYTE) return false;
+  }
+  let control = 0;
+  for (let i = 0; i < head.length; i++) {
+    const b = head[i]!;
+    // Tab, newline, vertical tab, form feed and carriage return are text.
+    if (b < 0x20 && (b < 0x09 || b > 0x0d)) control++;
+  }
+  return control >= head.length * MPEG_TS_MIN_CONTROL_SHARE;
+}
+
+/** Whether `filePath` carries the one extension MPEG-TS shares with a language. */
+export function hasMpegTsExtension(filePath: string): boolean {
+  return filePath.length > 3 && filePath.slice(-3).toLowerCase() === '.ts';
+}
+
 /**
  * Whether a file is one CodeGraph can parse, based purely on its extension.
  * This is the single source of truth for "should we index this file" — derived
@@ -183,10 +245,14 @@ export const EXTENSION_MAP: Record<string, Language> = {
  * `overrides` is the project's validated custom extension → language map (from
  * `codegraph.json`); when present its extensions count as indexable in addition
  * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
+ *
+ * `rootDir` is the project root `filePath` is relative to. A Shopify theme's
+ * JSON templates count only when it is given, since telling a theme apart takes
+ * a look at the files beside them (see `isShopifyLiquidJson`).
  */
-export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>, rootDir?: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
-  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isShopifyLiquidJson(filePath, rootDir)) return true; // Shopify OS 2.0 JSON templates / section groups
   if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
@@ -195,14 +261,54 @@ export function isSourceFile(filePath: string, overrides?: Record<string, Langua
 }
 
 /**
+ * What marks a Shopify theme's root, beside its `templates/` and `sections/`:
+ * the `layout/theme.liquid` every theme must have, or its settings schema.
+ */
+const SHOPIFY_THEME_MARKERS = ['layout/theme.liquid', 'config/settings_schema.json'];
+
+/** The folders a Shopify theme is made of. */
+const SHOPIFY_THEME_FOLDERS = /^(assets|blocks|config|layout|locales|sections|snippets|templates)$/i;
+
+/**
+ * The root of the Shopify theme `filePath` is in: the directory holding the
+ * theme folder (one `folders` matches) the file sits in, when that directory
+ * also holds one of `SHOPIFY_THEME_MARKERS`. Project-relative and
+ * `/`-separated, '' for the project root; undefined when the file is in no
+ * theme. `exists` says whether a project-relative path exists. The folder
+ * nearest the file is tried first.
+ */
+export function shopifyThemeRoot(
+  filePath: string,
+  exists: (relativePath: string) => boolean,
+  folders: RegExp = SHOPIFY_THEME_FOLDERS,
+): string | undefined {
+  const segments = filePath.split('/');
+  for (let i = segments.length - 2; i >= 0; i--) {
+    if (!folders.test(segments[i]!)) continue;
+    const themeDir = segments.slice(0, i).join('/');
+    if (SHOPIFY_THEME_MARKERS.some((marker) => exists(themeDir ? `${themeDir}/${marker}` : marker))) return themeDir;
+  }
+  return undefined;
+}
+
+/**
  * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
  * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
  * extractor links them. (config/ + locales/ JSON have no section refs.)
+ *
+ * Only inside a Shopify theme: the directory holding that `templates/` or
+ * `sections/` must also hold one of `SHOPIFY_THEME_MARKERS`. Plenty of other
+ * projects keep JSON in folders with those names — a .NET project template's
+ * `templates/<name>/.template.config/template.json`, schematics, CMS content —
+ * and it is not Liquid. The theme is looked for under `rootDir`, the project
+ * root `filePath` is relative to; without one there is no theme to find.
  */
-export function isShopifyLiquidJson(filePath: string): boolean {
+export function isShopifyLiquidJson(filePath: string, rootDir?: string): boolean {
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
-  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+  if (rootDir === undefined || !/(^|\/)(templates|sections)\/.+\.json$/i.test(filePath)) return false;
+  const exists = (relativePath: string): boolean => fs.existsSync(path.join(rootDir, relativePath));
+  return shopifyThemeRoot(filePath, exists, /^(templates|sections)$/i) !== undefined;
 }
 
 /**
@@ -316,29 +422,30 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // tarball. Replaces the ^0.22 tree-sitter-wasms build (ABI 14 → 15). NOT
   // graph-neutral — the classified delta list lives in the php checklist doc.
   'php',
-  // R7b (Swift kernel port prep): tree-sitter-swift crate 0.7.3. Built from
-  // the CRATE TARBALL's src/ (NOT a tag sha-match: alex-pinkus keeps
-  // generated files off main and the 0.7.3-with-generated-files tag ships an
-  // older ABI-14 generation; grammar.json rules are JSON-equal, and the crate
-  // tarball is byte-for-byte what the kernel's cargo build compiles — table
-  // identity by construction). Replaces the ^0.4.0 tree-sitter-wasms build
-  // (ABI 13 → 15). NOT graph-neutral — delta is error-set membership only;
-  // classified list in the swift checklist doc.
+  // R7b (Swift kernel port prep): tree-sitter-swift crate tarball, 0.7.4
+  // since #3212 (0.7.3 read the body of `if try await f() {` as a trailing
+  // closure). Built from the CRATE TARBALL's src/ (NOT a tag sha-match:
+  // alex-pinkus keeps generated files off main), and the kernel compiles the
+  // same tarball's src/ (codegraph-kernel/grammars/swift) — table identity by
+  // construction. Both carry docs/grammars/tree-sitter-swift.patch (the
+  // scanner's out-of-memory report uses stdio, which a wasm parser lacks) —
+  // see that doc's .md.
   'swift',
-  // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
-  // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
-  // to the tree-sitter-wasms build (0 CST/error disagreements across the
-  // gate repos) — a reproducibility re-vendor, ABI stays 14. The crates.io
-  // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
-  // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
-  // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
+  // fwcd/tree-sitter-kotlin main@d6af96d2e23e (untagged; 0.3.8, the newest
+  // tag, read a call named after a modifier keyword as a modifier, #3410),
+  // built unpatched from the commit's checked-in src/ with tree-sitter-cli
+  // 0.25.10 and emsdk 4.0.4 (docs/grammars/tree-sitter-kotlin.md); ABI 14.
+  // No crates.io release carries it and tree-sitter-kotlin-ng is a different
+  // grammar, so the kernel compiles the same C sources
+  // (codegraph-kernel/grammars/kotlin).
   'kotlin',
-  // R7b batch 4 (Dart kernel port prep): the byte-copied tree-sitter-wasms
-  // 0.1.13 artifact (sha256 7f5364e4…, built from UserNobody14/
-  // tree-sitter-dart master@d4d8f3e337d8). tree-sitter-wasms' dart dep is an
-  // UNPINNED github ref, so a routine tree-sitter-wasms update would have
-  // silently changed dart's grammar — vendoring kills that hazard. The
-  // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
+  // Built from UserNobody14/tree-sitter-dart master@0038280b774b (Dart 3.13
+  // primary constructors, #3270) with tree-sitter-cli 0.25.10 and emsdk 4.0.4
+  // (docs/grammars/tree-sitter-dart.md); it replaced R7b batch 4's byte-copy
+  // of the tree-sitter-wasms 0.1.13 artifact (d4d8f3e). tree-sitter-wasms'
+  // dart dep is an UNPINNED github ref, so a routine tree-sitter-wasms update
+  // would have silently changed dart's grammar — vendoring kills that hazard.
+  // The kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
   // Cangjie 1.0.5 grammar, built from the checked-in parser.c/scanner.c
@@ -360,7 +467,9 @@ function resolveWasmPath(lang: GrammarLanguage): string {
  * SFC languages (svelte/vue/astro) have no grammar of their own — their
  * extractors delegate <script>/frontmatter content to the TS/JS extractor, so
  * those grammars must be loaded even when no plain .ts/.js file is in the index
- * set (e.g. a pure-.astro content site). CFML (.cfc/.cfm) likewise delegates
+ * set (e.g. a pure-.astro content site). A Vue `<script lang="tsx">` is read
+ * with the TSX grammar (#2570), which nothing else loads in a project without
+ * a .tsx or .js file. CFML (.cfc/.cfm) likewise delegates
  * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
  * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
  */
@@ -368,8 +477,16 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
     languages = [...languages, 'typescript', 'javascript'];
   }
+  if (languages.includes('vue')) {
+    languages = [...languages, 'tsx'];
+  }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
+  }
+  // A view's `@code` blocks are C#, its `<script>` blocks JavaScript or
+  // TypeScript. A sync that re-reads only a view loads what the view needs.
+  if (languages.includes('razor')) {
+    languages = [...languages, 'csharp', 'typescript', 'javascript'];
   }
   return languages;
 }
@@ -480,32 +597,174 @@ export function getParser(language: Language): Parser | null {
  * `overrides` is the project's validated custom extension → language map (from
  * `codegraph.json`); when present its mappings take precedence over the built-in
  * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
+ *
+ * `rootDir` is the project root `filePath` is relative to, as for
+ * `isSourceFile`: a Shopify theme's JSON templates are Liquid only with it.
  */
-export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>, rootDir?: string): Language {
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
-  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
-  // links each section `"type"` to its `sections/<type>.liquid`).
-  if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // A Shopify theme's OS 2.0 JSON templates / section groups → the Liquid
+  // extractor (it links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath, rootDir)) return 'liquid';
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
+  // A Flow-typed `.js` (`// @flow` in its leading comments) parses as TSX:
+  // the JavaScript grammar can't read its annotations — `render(): React.Node`
+  // cut a class short — and TypeScript's syntax covers most of Flow's.
+  if ((lang === 'javascript' || lang === 'jsx') && source && hasFlowPragma(source)) return 'tsx';
+
   // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
     if (looksLikeObjc(source)) return 'objc';
+    // A declaration-only C++ header (#3397) — checked after Objective-C,
+    // whose `NSArray<NSString *> *` generics and block parameter lists share
+    // its shapes.
+    if (findCppDeclarationSyntax(source) !== null) return 'cpp';
+  }
+
+  // `.inc` is PHP's include extension (Drupal) and Pascal/Delphi's too
+  // (`{$I defs.inc}`: directive blocks, declaration fragments), so it is
+  // decided per file by content (#2279). An explicit codegraph.json mapping
+  // for `.inc` is the user's answer and is not second-guessed.
+  if (lang === 'php' && ext === '.inc' && source && !(overrides && overrides[ext]) && looksLikePascalInclude(source)) {
+    return 'pascal';
   }
 
   return lang;
 }
 
+/** A PHP open tag: `<?php` in any case, or the short echo `<?=` (never `<?xml`). */
+const PHP_OPEN_TAG_RE = /<\?(?:php|=)/i;
+
+// Building blocks for the Pascal line shapes below. A line start allows
+// indentation and the BOM Windows editors write (a BOM'd Delphi include must
+// not drop back to PHP). A section keyword's break runs to the end of its line
+// and over blank / comment-only lines, up to the first declaration.
+const PAS_LINE = String.raw`^[ \t\uFEFF]*`;
+const PAS_NAME = String.raw`[a-z_]\w*(?:<[^>\n]*>)?`;
+const PAS_QNAME = String.raw`[a-z_][\w.]*(?:<[^>\n]*>)?`;
+const PAS_COMMENT = String.raw`(?:\/\/[^\n]*|\{[^$}\n][^}\n]*\}[ \t]*)?`;
+const PAS_SECTION_BREAK = String.raw`[ \t]*${PAS_COMMENT}(?:\r?\n[ \t]*${PAS_COMMENT})+`;
+const pascalLine = (shape: string): RegExp => new RegExp(PAS_LINE + shape, 'im');
+
+/**
+ * Line shapes only Pascal writes, any one of which makes an untagged `.inc`
+ * Pascal. Each leans on Pascal's own punctuation, so the dialects that share a
+ * keyword with it stay out: JavaScript `const x = 1;` / `function f() {`,
+ * SourcePawn `function void (int client);`, C++ `const T X::Y = …`, VBScript
+ * `Const X = 1` / `Function F(a)`, Smarty `{$var}`, Makefile `X := y`, prose
+ * with `Begin` on a line of its own. Every pattern stays linear on a long
+ * whitespace run: no run can be split two ways between neighbouring
+ * quantifiers.
+ */
+const PASCAL_INCLUDE_SIGNALS: readonly RegExp[] = [
+  // A compiler directive: a name and an argument (`{$IFDEF X}`, `{$DEFINE X}`,
+  // `{$I file.inc}`, `{$WARN X OFF}`), a bare `{$ELSE}` / `{$ENDIF}` /
+  // `{$IFEND}`, or a switch (`{$R-}`, `{$A+,B-}`) — or the `{%MainUnit x.pp}`
+  // line Lazarus opens its include files with.
+  pascalLine(String.raw`\{(?:\$(?:[a-z]\w*[ \t]+[^\s}]|(?:else|endif|ifend)[ \t]*\}|[a-z][+-][,}])|%MainUnit\b)`),
+  // A routine header, closed by `;`: `procedure Foo;`, `procedure TForm1.Click(Sender: TObject);`,
+  // `class constructor Create;` — and a function's result type after its
+  // parameters (`function Bar(A: Integer): string;`; bare `function Bar;` is
+  // the implementation-section short form). The parameter list stops at any
+  // parenthesis, so a file of unclosed `procedure X(` lines stays linear.
+  pascalLine(
+    String.raw`(?:class[ \t]+)?(?:(?:procedure|constructor|destructor)[ \t]+${PAS_QNAME}[ \t]*(?:\([^()]*\)[ \t]*)?` +
+      String.raw`|function[ \t]+${PAS_QNAME}[ \t]*(?:(?:\([^()]*\)[ \t]*)?:[ \t]*[\w.]+(?:<[^>\n]*>)?[ \t]*)?);`
+  ),
+  // `unit Foo;` and a `uses A, B;` clause.
+  pascalLine(String.raw`unit[ \t]+[a-z_][\w.]*[ \t]*;`),
+  pascalLine(String.raw`uses\s+[a-z_][\w.]*(?:\s*,\s*[a-z_][\w.]*)*\s*;`),
+  // A `const` section, then `X = …` / `X: T = …`; or a typed constant on one
+  // line (`const Max: Integer = 10;`). The type never holds a `:`.
+  pascalLine(
+    String.raw`(?:const|resourcestring)(?:${PAS_SECTION_BREAK}[a-z_]\w*[ \t]*(?::[^=;:\n]+)?=|[ \t]+[a-z_]\w*[ \t]*:[^=;:\n]+=)`
+  ),
+  // A `var` section: `G, H: Integer;`, on the keyword's line or below it.
+  pascalLine(
+    String.raw`(?:var|threadvar)(?:${PAS_SECTION_BREAK}|[ \t]+)[a-z_]\w*(?:[ \t]*,[ \t]*[a-z_]\w*)*[ \t]*:(?!:)[^;\n]*;`
+  ),
+  // A `type` section, then `TFoo =`; or `type TFoo = class…` (record /
+  // interface / set of / array / procedure type) on one line.
+  pascalLine(
+    String.raw`type(?:${PAS_SECTION_BREAK}${PAS_NAME}[ \t]*=|[ \t]+${PAS_NAME}[ \t]*=[ \t]*(?:packed[ \t]+)?` +
+      String.raw`(?:class|record|object|interface|dispinterface|set[ \t]+of|array|reference[ \t]+to|procedure|function)\b)`
+  ),
+];
+
+/** A `begin` … `end;` block: both halves needed, so neither alone flips a file. */
+const PASCAL_BEGIN_RE = pascalLine(String.raw`begin\b`);
+const PASCAL_END_RE = pascalLine(String.raw`end[ \t]*[;.][ \t]*$`);
+
+/**
+ * Whether an `.inc` file is a Pascal include rather than a PHP one (#2279).
+ *
+ * A PHP include always opens a PHP tag somewhere, so a tag anywhere keeps the
+ * file PHP. Without one, a Pascal-only line shape (`PASCAL_INCLUDE_SIGNALS`,
+ * or a `begin` … `end;` pair) makes it Pascal. Anything else keeps the PHP
+ * mapping — untagged text is inline HTML to PHP, so nothing is extracted —
+ * rather than handing a C / assembly / POV-Ray / ASP `.inc` to the Pascal
+ * grammar's error recovery.
+ *
+ * Deliberately per file, not "does this project have `.pas` files": the
+ * answer depends only on the file's own bytes, so a full index, a sync of one
+ * edited include, and a fresh re-index always agree — a project-level gate
+ * would flip an untouched include whenever the last `.pas` file came or went.
+ */
+function looksLikePascalInclude(source: string): boolean {
+  if (PHP_OPEN_TAG_RE.test(source)) return false;
+  if (PASCAL_INCLUDE_SIGNALS.some((re) => re.test(source))) return true;
+  return PASCAL_BEGIN_RE.test(source) && PASCAL_END_RE.test(source);
+}
+
+/** Whether a JavaScript file's leading comments carry Flow's `@flow` pragma (and not `@noflow`). */
+export function hasFlowPragma(source: string): boolean {
+  const head = source.slice(0, 4096).replace(/^#![^\n]*\n/, '');
+  const lead = /^(?:\s*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/))*/.exec(head)?.[0] ?? '';
+  return /@flow\b/.test(lead) && !/@noflow\b/.test(lead);
+}
+
+/**
+ * A class/struct BASE CLAUSE — `struct Derived : Base {`, `class Foo final :
+ * public Bar, private Baz {`, `struct D : ns::B<T> {` — which is never valid
+ * C. In C the only thing that can follow `struct <tag>` is `{`, `;`, `*`, an
+ * identifier (declarator), or a closing `)`: a bit-field's `:` sits after a
+ * member NAME inside the body (`unsigned a : 3;`), a ternary's `:` is
+ * separated from the tag by `)` / `*` / a declarator (`sizeof(struct foo) :
+ * 0`), and a label such as `struct_end:` has no whitespace after `struct`. An
+ * optional access specifier / `virtual` after the colon and an optional
+ * `final` before it cover the spelled-out forms; the base may be scoped
+ * (`ns::Base`) and carry template arguments, and must be followed by the
+ * body's `{` or a `,` introducing the next base — prose like
+ * `struct timeval: seconds and microseconds` inside a string never has that
+ * terminator. Comments are stripped before the scan (see `looksLikeCpp`).
+ */
+const CPP_BASE_CLAUSE_RE =
+  /\b(?:class|struct)\s+\w+\s*(?:final\s*)?:\s*(?:(?:public|protected|private|virtual)\s+)*[A-Za-z_][\w:]*(?:\s*<[^{};]*>)?\s*[{,]/;
+
+/** Block and line comments, for a code-only scan. Lazy block match → linear. */
+const C_COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
+
 /**
  * Heuristic: does a .h file contain C++ constructs?
- * Checks the first ~8KB for patterns that are unique to C++ and never valid C.
+ *
+ * Two passes. The first checks the first ~8KB for patterns that are unique to
+ * C++ and never valid C. The second scans the FULL source for a class/struct
+ * base clause (`CPP_BASE_CLAUSE_RE`): a large header with a long C-compatible
+ * preamble — include guards, `#define`s, plain C typedefs — can put its only
+ * C++ signal past the sample, and the cost of that miss is the C extractor
+ * (classTypes: []) dropping the derived type entirely and minting a phantom
+ * `function Base` from the base clause instead (#1592). The base-clause regex
+ * is anchored on a `struct`/`class` keyword followed by a tag and a colon, a
+ * shape with no C reading, so widening it to the whole file cannot drag a C
+ * header over to C++.
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
@@ -518,7 +777,235 @@ function looksLikeCpp(source: string): boolean {
   // routed through the C extractor (which extracts no classes), and its class
   // definition silently vanishes. The two-token shape (`<KW> <MACRO> <Name>`
   // before a `[:{]`) never occurs in valid C, so this can't misclassify C headers.
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  if (/\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample)) {
+    return true;
+  }
+  // Plain `struct Derived : Base` (no export macro, no `class` keyword, no
+  // explicit access section) — the #1159 branch above only recognizes the
+  // macro-annotated form. Scanned over the whole file, not the sample, with
+  // comments removed so a doc comment's prose (`struct foo: x, y`) can't
+  // flip a C header.
+  return CPP_BASE_CLAUSE_RE.test(source.replace(C_COMMENT_RE, ' '));
+}
+
+/**
+ * A code-only view of a header for {@link findCppDeclarationSyntax}: each
+ * comment and string or character literal becomes one space, and
+ * preprocessor directives — continuation lines included — are dropped, so
+ * prose, a format string or a macro body (`#define MIN(a, b) ((a) < (b) ? …)`,
+ * `#define REF(T) T &`) never reads as a declaration. One left-to-right pass
+ * over comments and literals, so a `//` in a string or a quote in a comment
+ * can't open the other. A comment is one space to the preprocessor too, so a
+ * block comment's newlines go with it. A backslash continues a line before
+ * `\n` or `\r\n`.
+ */
+const C_NOISE_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:[^"\\\n]|\\(?:\r\n|[\s\S]))*"|'(?:[^'\\\n]|\\(?:\r\n|[\s\S]))*'/g;
+const C_DIRECTIVE_RE = /^[ \t]*#(?:[^\\\n]|\\(?:\r\n|[\s\S]))*/gm;
+
+function cDeclarationView(source: string): string {
+  return source.replace(C_NOISE_RE, ' ').replace(C_DIRECTIVE_RE, '');
+}
+
+const CPP_ID = String.raw`[A-Za-z_]\w*`;
+/**
+ * A possibly scoped name: `qstring`, `std::string`. Written without spaces or
+ * a leading `::`, so a run of names splits into tokens one way only — with
+ * either, `a :: b :: c …` splits combinatorially and the scan never ends.
+ */
+const CPP_QID = String.raw`${CPP_ID}(?:::${CPP_ID})*`;
+/**
+ * A template argument list of type-like tokens, nested one level:
+ * `<IDiaDataSource>`, `<std::string, int>`, `<std::vector<int>>`. No
+ * operators but `*` — a comparison chain such as `a < b && c > d` can't be one.
+ */
+const CPP_TEMPLATE_ARGS = String.raw`<[\w\s:*,]*(?:<[\w\s:*,]*>[\w\s:*,]*)*>`;
+/**
+ * Where a declaration can begin: the start of the code, or after the `;`,
+ * `{` or `}` that ends what came before. A line that merely continues an
+ * expression (`return a +⏎ b * f(c & d);`) never follows one.
+ */
+const C_STATEMENT_START = String.raw`(?:^|[;{}])\s*`;
+
+/**
+ * `const T &` / `T const &` — a reference to const, anywhere. In C, `const`
+ * is followed by a type and then a declarator, never by `&` (a cast's `)` or
+ * a pointer's `*` always comes between: `(const char *)&x`).
+ */
+const CPP_CONST_REF_RE = new RegExp(
+  String.raw`\bconst\s+(?:(?:unsigned|signed|short|long|struct|union|enum|class|typename)\s+)*` +
+    String.raw`${CPP_QID}(?:${CPP_TEMPLATE_ARGS})?(?:\s*\*)*\s*&(?![&=])|\bconst\s*&(?![&=])`
+);
+
+/**
+ * A declaration whose type is a template instantiation, at the start of a
+ * declaration: `extern CComPtr<IDiaDataSource> g_pDiaDataSource;`,
+ * `std::vector<int> &items();`. The `<` touches its name, and a declarator
+ * name follows the `>` — `a < b > c;` is no C statement anyone writes.
+ */
+const CPP_TEMPLATE_DECLARATION_RE = new RegExp(
+  C_STATEMENT_START +
+    String.raw`(?:(?:extern|static|inline|const|volatile|typedef|constexpr|thread_local|mutable)\s+)*` +
+    String.raw`${CPP_QID}${CPP_TEMPLATE_ARGS}[\s*&]*(?:const\b[\s*&]*)?${CPP_ID}\s*[;=(\[{]`
+);
+
+/**
+ * The head of a function declaration or definition: return-type tokens, then
+ * the declarator name and its `(`, at the start of a declaration
+ * (`HRESULT GetPath(`, `static qstring GetFileContext(`, `char *dup(`).
+ * Group 1 is the type tokens, group 2 the name.
+ */
+const CPP_FUNCTION_HEAD_RE = new RegExp(
+  C_STATEMENT_START + String.raw`((?:${CPP_QID}(?:${CPP_TEMPLATE_ARGS})?[\s*&]+){1,8})(${CPP_ID})\s*\(`,
+  'g'
+);
+
+/**
+ * Words of a statement, never of a declaration's type: `return f(a & b);`,
+ * `else g(x = 1);`, mimalloc's `if mi_unlikely(p != NULL)`, or a statement
+ * macro with no `;` before the next line's `return f(&x);`.
+ */
+const C_STATEMENT_KEYWORDS = new Set([
+  'return', 'else', 'if', 'while', 'for', 'switch', 'do', 'case', 'default', 'goto', 'break', 'continue',
+  'sizeof', 'asm', '__asm', '__asm__',
+]);
+/**
+ * Specifiers and qualifiers. A function head needs a type besides these, so a
+ * function-like macro declaring something (`static DECLARE_BITMAP(map, 1 << N);`)
+ * is not one.
+ */
+const C_DECL_SPECIFIERS = new Set([
+  'extern', 'static', 'inline', '__inline', '__inline__', 'const', 'volatile', 'register', 'typedef',
+  'restrict', '__restrict', '__extension__', 'thread_local', '_Thread_local', '__thread', 'constexpr',
+]);
+/** Names that a `(` follows without being a function's: keywords, operators and builtins. */
+const C_NOT_FUNCTION_NAMES = new Set([
+  'if', 'while', 'for', 'switch', 'return', 'sizeof', 'typeof', '__typeof', '__typeof__', 'typeof_unqual',
+  '_Alignof', 'alignof', '__alignof__', '_Alignas', 'alignas', '_Atomic', '_Generic', '_Static_assert',
+  'static_assert', '__attribute', '__attribute__', '__declspec', 'asm', '__asm', '__asm__', 'volatile',
+  '__volatile__', 'decltype', 'noexcept', 'throw', 'defined', '__builtin_offsetof', '__builtin_va_arg',
+]);
+
+/**
+ * What a parameter list holds at its top level — outside nested parentheses
+ * and brackets, so an array bound (`int a[N & M]`), an attribute or a function
+ * pointer's own parameters drop out. `open` is the list's `(`. Null when the
+ * list doesn't close within a few thousand characters or runs into a `;`, `{`
+ * or `}` — no C parameter list holds one, and stopping there means no stretch
+ * of the code is scanned twice — or when it holds none of the characters
+ * {@link hasCppParameterSyntax} looks for: the common case, kept to one scan
+ * with no string built.
+ */
+function topLevelParameters(code: string, open: number): string | null {
+  let depth = 0;
+  let nested = false;
+  let close = -1;
+  const end = Math.min(code.length, open + 4000);
+  for (let i = open + 1; i < end && close < 0; i++) {
+    const ch = code.charCodeAt(i);
+    if (ch === 0x3b /* ; */ || ch === 0x7b /* { */ || ch === 0x7d /* } */) return null;
+    if (ch === 0x28 /* ( */ || ch === 0x5b /* [ */) {
+      depth++;
+      nested = true;
+    } else if (ch === 0x29 /* ) */ || ch === 0x5d /* ] */) {
+      if (depth === 0) {
+        if (ch !== 0x29) return null;
+        close = i;
+      } else depth--;
+    }
+  }
+  if (close < 0) return null;
+  let params = code.slice(open + 1, close);
+  if (!/[&=<]/.test(params)) return null;
+  // Innermost groups first, until none is left.
+  while (nested && /[([]/.test(params)) {
+    const flat = params.replace(/\([^()[\]]*\)|\[[^()[\]]*\]/g, ' ');
+    if (flat === params) return null;
+    params = flat;
+  }
+  return params;
+}
+
+/**
+ * A reference declarator after its type, spaced the way references are and
+ * bitwise `&` isn't: `bstr_t& path`, `UInt64 &resPos`, `T*&`, unnamed `Foo&`.
+ * An address-of (`f(&x)`, `f(a, &b)`) has no type before it, and an operand
+ * pair spaced evenly (`x & mask`, `x&mask`) is left alone.
+ */
+const CPP_REFERENCE_PARAMETER_RE = /[\w>*]&(?=[\s,]|$)|[\w>*]\s+&(?=[A-Za-z_])|[\w>*]\s*&\s*(?:,|$)/;
+/** A default argument: a type, a name, then `=` (`int depth = 0`, `qvector<qstring>* p = nullptr`). */
+const CPP_DEFAULT_ARGUMENT_RE = new RegExp(
+  String.raw`(?:^|,)\s*(?:${CPP_QID}(?:${CPP_TEMPLATE_ARGS})?[\s*&]+)+${CPP_ID}\s*=(?!=)`
+);
+/** A parameter of template-instantiated type: `qvector<qstring>* paths`, `const std::map<K, V> &m`. */
+const CPP_TEMPLATE_PARAMETER_RE = new RegExp(
+  String.raw`(?:^|,)\s*(?:(?:const|volatile|struct|class|typename|enum)\s+)*${CPP_QID}${CPP_TEMPLATE_ARGS}`
+);
+
+/**
+ * Whether a function's top-level parameters use syntax only C++ has: a
+ * reference, a default argument or a template-instantiated type. A C
+ * parameter is a declaration — specifiers and a declarator — so none of
+ * these can appear in one.
+ */
+function hasCppParameterSyntax(params: string): boolean {
+  return (
+    CPP_REFERENCE_PARAMETER_RE.test(params) ||
+    CPP_DEFAULT_ARGUMENT_RE.test(params) ||
+    CPP_TEMPLATE_PARAMETER_RE.test(params)
+  );
+}
+
+/**
+ * Heuristic: does a .h file declare something with syntax that only C++ has
+ * (#3397)? A declaration-only C++ header — free function prototypes and
+ * `extern` variables, no `class`, `namespace` or `template` — gives
+ * {@link looksLikeCpp} nothing to see, so it went to the C grammar, whose
+ * error recovery dropped every symbol. Returns the declaration that decides
+ * it, for tests and diagnostics, or null.
+ *
+ * Three shapes, read from a code-only view ({@link cDeclarationView}) of the
+ * whole file:
+ * - a reference to const (`const qstring &name`) — {@link CPP_CONST_REF_RE};
+ * - a declaration whose type is a template instantiation
+ *   (`extern CComPtr<IDiaDataSource> g_p;`) — {@link CPP_TEMPLATE_DECLARATION_RE};
+ * - a function whose parameters hold a reference, a default argument or a
+ *   template type (`HRESULT f(bstr_t& p, T *q = nullptr);`) —
+ *   {@link hasCppParameterSyntax}. The function head is held to what a C
+ *   declaration looks like, so a call or an expression can't stand in for
+ *   one: it begins a declaration, carries a type besides specifiers and
+ *   qualifiers, and its name is neither a keyword (`if`, `sizeof`,
+ *   `__attribute__`) nor an ALL-CAPS macro (`static DEFINE_SPINLOCK(x);`).
+ *
+ * An Objective-C header — an `#import`, or an `@` anywhere in its code
+ * (`@interface`, `@"…"`, `@[…]`) — is left alone: its generics and block
+ * parameters look like C++, and {@link looksLikeObjc} only samples the head of
+ * the file. A C header that declares C++ this way in an `#ifdef __cplusplus`
+ * section reads as C++, as one with a class or a template there already does.
+ */
+export function findCppDeclarationSyntax(source: string): string | null {
+  if (/^[ \t]*#[ \t]*import\b/m.test(source)) return null;
+  const code = cDeclarationView(source);
+  if (code.includes('@')) return null;
+
+  const constRef = CPP_CONST_REF_RE.exec(code);
+  if (constRef) return constRef[0].trim();
+  const templateDecl = CPP_TEMPLATE_DECLARATION_RE.exec(code);
+  if (templateDecl) return templateDecl[0].replace(/^[;{}]/, '').trim();
+
+  CPP_FUNCTION_HEAD_RE.lastIndex = 0;
+  for (let m = CPP_FUNCTION_HEAD_RE.exec(code); m; m = CPP_FUNCTION_HEAD_RE.exec(code)) {
+    const name = m[2]!;
+    if (C_NOT_FUNCTION_NAMES.has(name) || /^_*[A-Z][A-Z0-9_]*$/.test(name)) continue;
+    const words = m[1]!.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, ' ').match(/[A-Za-z_]\w*/g) ?? [];
+    if (words.some((w) => C_STATEMENT_KEYWORDS.has(w))) continue;
+    if (words.every((w) => C_DECL_SPECIFIERS.has(w))) continue;
+    const open = m.index + m[0].length - 1;
+    const params = topLevelParameters(code, open);
+    if (params !== null && hasCppParameterSyntax(params)) {
+      return `${m[0].replace(/^[;{}]/, '').trim()}${params})`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -527,6 +1014,19 @@ function looksLikeCpp(source: string): boolean {
 function looksLikeObjc(source: string): boolean {
   const sample = source.substring(0, 8192);
   return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
+}
+
+/**
+ * Whether a language has a tree-sitter grammar of its own.
+ *
+ * Narrower than {@link isLanguageSupported}, which also answers true for the
+ * formats handled by custom extractors (SFCs, Liquid, Razor, YAML, XML,
+ * properties) — those have extraction but no grammar, so anything that needs to
+ * PARSE the file (the viewer's syntax classification, for one) has to ask this
+ * instead.
+ */
+export function hasTreeSitterGrammar(language: string | undefined | null): boolean {
+  return !!language && language in WASM_GRAMMAR_FILES;
 }
 
 /**
@@ -568,6 +1068,15 @@ export function isGrammarLoaded(language: Language): boolean {
  */
 export function isFileLevelOnlyLanguage(language: Language): boolean {
   return language === 'yaml' || language === 'twig' || language === 'properties';
+}
+
+/**
+ * Whether files of this language are expected to yield symbols, so that a
+ * language with none is news. Not so for the file-level languages, nor for
+ * `xml`, where only MyBatis mappers yield anything.
+ */
+export function yieldsSymbols(language: Language): boolean {
+  return !isFileLevelOnlyLanguage(language) && language !== 'xml' && language !== 'unknown';
 }
 
 /**
@@ -614,6 +1123,21 @@ export function getUnavailableGrammarErrors(): Partial<Record<Language, string>>
     out[language] = message;
   }
   return out;
+}
+
+/**
+ * Whether these extraction errors say the file was never parsed because its
+ * grammar was not available (`parser_error`, recorded by the extractor when
+ * `getParser` has nothing for the language).
+ *
+ * That is a fact about the running process, not about the file: a daemon whose
+ * install was upgraded or deleted underneath it fails every lazy grammar load
+ * (#2335). Such a result must never replace a file's index data, and a row an
+ * older engine stored that way must be re-indexed — not treated as current
+ * because its content hash still matches.
+ */
+export function hasGrammarLoadFailure(errors: readonly ExtractionError[] | undefined): boolean {
+  return !!errors && errors.some((e) => e.code === 'parser_error');
 }
 
 /**

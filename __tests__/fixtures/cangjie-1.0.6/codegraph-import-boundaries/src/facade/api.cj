@@ -1,0 +1,3 @@
+package codegraph_import_boundaries.facade
+
+public import codegraph_import_boundaries.library.makeLabel

@@ -20,13 +20,27 @@ export CODEGRAPH_TELEMETRY=0   # per-shell / per-CI override
 export DO_NOT_TRACK=1          # the cross-tool standard — always honored
 ```
 
+For one MCP server entry, add `--no-telemetry` to its arguments
+(`"args": ["serve", "--mcp", "--no-telemetry"]`). It works like
+`CODEGRAPH_TELEMETRY=0` for that server and for the background daemon it starts.
+A daemon that is already running for the project, started by a server without
+the flag, keeps its own setting until it exits; `codegraph telemetry off` covers
+every process.
+
 `codegraph telemetry status` shows the current state, what decided it, and your machine ID.
 The interactive installer (`codegraph install`) asks up front with a visible default-on
 toggle and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
 a one-line notice is printed to stderr before the first time anything is sent.
 
 Off means off: when disabled, CodeGraph records nothing, opens no connection to the
-telemetry endpoint, and sends no "opted out" ping.
+telemetry endpoint, and sends no "opted out" ping. Running processes recheck the stored
+choice before recording, persisting, and each send. Turning it off removes the local
+identity and unsent queues (including claimed queues); turning it back on creates a new
+identity. An HTTP request already started cannot be recalled, but opt-out prevents later
+request chunks and prevents its unsent data from being requeued.
+
+Environment overrides still apply: `CODEGRAPH_TELEMETRY=1` explicitly forces telemetry
+on for that process even when the stored choice is off; `DO_NOT_TRACK=1` takes precedence.
 
 Separately from telemetry, the MCP server checks GitHub for a newer release in the
 background (at most once a day) so it can tell you an update exists — it fetches a
@@ -65,13 +79,25 @@ And one of four events:
 Usage is **aggregated locally into daily totals** before anything is sent — there is no
 per-call event stream, and nothing is sent in real time.
 
+### The browser viewer sends nothing
+
+`codegraph ui` (the local viewer) has no telemetry of its own. The server it starts
+makes no outbound connections at all, and the page in your browser talks only to that
+server on `127.0.0.1`: nothing about the symbols you open, the searches you type, or the
+path you walk leaves your machine, and none of it is recorded anywhere. The only thing
+telemetry ever learns about the viewer is what it learns about every command: that a
+command named `ui` was run, once, on a day, in the daily `usage_rollup` above. The
+command never triggers a send of its own, and `codegraph telemetry off`,
+`CODEGRAPH_TELEMETRY=0`, or `DO_NOT_TRACK=1` switches off even that count, as it does
+everything else on this page.
+
 ## What is never collected
 
 - **No source code.** No file paths, file names, directory names, repository names or
   URLs, symbol names, search queries, or anything else derived from the contents of an
   indexed project.
-- **No IP addresses.** The ingest endpoint never reads, logs, or forwards the client IP,
-  and IP discarding is enabled at the analytics backend on top of that. No geolocation.
+- **No IP addresses.** The ingest endpoint never reads, logs, or stores the client IP —
+  and there is no analytics vendor downstream that could. No geolocation.
 - **No fingerprinting.** The machine ID is a random UUID stored in
   `~/.codegraph/telemetry.json` — delete that file (or run `codegraph telemetry off`,
   then `on`) and the old ID is gone forever, with no way to reconnect it.
@@ -81,12 +107,29 @@ per-call event stream, and nothing is sent in real time.
 
 Events POST to `telemetry.getcodegraph.com` — a first-party endpoint whose complete
 source lives in [`telemetry-worker/`](telemetry-worker/) in this repository. It validates
-every event and property against the allowlist above (anything else is dropped), strips
-IPs, rate-limits, and forwards to a managed analytics store (PostHog, US region) as
-anonymous events. Sends are fire-and-forget with a short timeout: offline or air-gapped
-machines buffer a bounded local file (256 KB cap) and never retry-loop, log errors, or
-slow a command down. Telemetry never adds latency to MCP tool calls — recording is an
-in-memory counter.
+every event and property against the allowlist above (anything else is dropped), never
+reads the client IP, and rate-limits per machine ID. Sends are fire-and-forget with a
+short timeout: offline or air-gapped machines buffer a bounded local file (256 KB cap)
+and never retry-loop, log errors, or slow a command down. Recording refreshes the small local consent file, then increments an in-memory counter;
+MCP tool calls never wait for telemetry network requests or queue writes.
+
+## Where it is stored
+
+Accepted events are written to **our own database on Cloudflare** (D1) and go nowhere
+else. **No third-party analytics vendor receives any of this data**, because the ingest
+endpoint makes no outbound requests at all — its source is the entire path your events
+take, and there is nothing after it. This is a stronger guarantee than a promise not to
+share: there is no second party to share with.
+
+What is kept is checkable rather than asserted. The storage schema —
+[`telemetry-worker/migrations/`](telemetry-worker/migrations/), checked in beside the
+endpoint that writes it — is the complete list of what a row can hold, with a comment on
+every column.
+
+Individual events are **deleted after 90 days**. What outlives them is anonymous daily
+totals: counts per day of things like operating system, version, and language, plus which
+days each machine ID was active so returning-user numbers survive. No event details, and
+still nothing that identifies a person or a codebase.
 
 The engineering contract behind all of this — including the rule that schema changes must
 update this page, the client, and the public endpoint in one PR — is in

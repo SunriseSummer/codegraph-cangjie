@@ -11,6 +11,7 @@ import * as os from 'os';
 import CodeGraph from '../src/index';
 import { Node, Edge } from '../src/types';
 import { GraphTraverser } from '../src/graph/traversal';
+import { ToolHandler } from '../src/mcp/tools';
 
 describe('Graph Queries', () => {
   let testDir: string;
@@ -242,6 +243,24 @@ export { main };
       expect(hierarchy.nodes.has(derivedClass.id)).toBe(true);
     });
 
+    it('returns the subtypes and implementors of a type, not only its ancestors', () => {
+      const base = cg.getNodesByKind('class').find((n) => n.name === 'BaseClass')!;
+      const printable = cg.getNodesByKind('interface').find((n) => n.name === 'Printable')!;
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass')!;
+
+      const fromBase = cg.getTypeHierarchy(base.id);
+      expect(fromBase.nodes.has(derived.id)).toBe(true);
+      expect(fromBase.edges.some((e) => e.source === derived.id && e.target === base.id && e.kind === 'extends')).toBe(true);
+
+      const fromInterface = cg.getTypeHierarchy(printable.id);
+      expect(fromInterface.nodes.has(derived.id)).toBe(true);
+      expect(fromInterface.edges.some((e) => e.source === derived.id && e.target === printable.id && e.kind === 'implements')).toBe(true);
+
+      // The ancestors still come back from the subtype's side.
+      const fromDerived = cg.getTypeHierarchy(derived.id);
+      expect(fromDerived.nodes.has(base.id) && fromDerived.nodes.has(printable.id)).toBe(true);
+    });
+
     it('should return empty subgraph for non-existent node', () => {
       const hierarchy = cg.getTypeHierarchy('non-existent-id');
 
@@ -341,6 +360,20 @@ export { main };
       // *contains* getName — climbing that contains edge would re-expand every
       // sibling method and explode impact for a leaf symbol. (#536)
       expect(impact.nodes.has(derived!.id)).toBe(false);
+    });
+
+    it('reads incoming edges without contains, in the same order as getIncomingEdges (#3248)', () => {
+      const queries = (cg as unknown as { queries: import('../src/db/queries').QueryBuilder }).queries;
+      const all = queries.getAllNodes();
+      let withContains = 0;
+      for (const node of all) {
+        const incoming = queries.getIncomingEdges(node.id);
+        const expected = incoming.filter((e) => e.kind !== 'contains');
+        if (expected.length !== incoming.length) withContains++;
+        expect(queries.getIncomingEdgesExceptContains(node.id)).toEqual(expected);
+      }
+      // The fixture exercises the filter: members have an incoming contains edge.
+      expect(withContains).toBeGreaterThan(0);
     });
   });
 
@@ -530,11 +563,72 @@ function tGraph(nodes: Node[], edges: Edge[]): GraphTraverser {
       edges.filter((e) => e.source === source && (!kinds || kinds.includes(e.kind))),
     getIncomingEdges: (target: string, kinds?: string[]) =>
       edges.filter((e) => e.target === target && (!kinds || kinds.includes(e.kind))),
+    getIncomingEdgesExceptContains: (target: string) =>
+      edges.filter((e) => e.target === target && e.kind !== 'contains'),
   };
   return new GraphTraverser(q as never);
 }
 
 describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
+  it('findPath keeps shortest-path order without duplicate frontier entries', () => {
+    const nodes = ['A', 'B', 'C', 'D', 'E'].map((id) => tNode(id));
+    const edges: Edge[] = [
+      { source: 'A', target: 'B', kind: 'calls', line: 1 },
+      { source: 'A', target: 'B', kind: 'references', line: 2 },
+      { source: 'A', target: 'C', kind: 'calls', line: 3 },
+      { source: 'B', target: 'D', kind: 'calls', line: 4 },
+      { source: 'C', target: 'D', kind: 'calls', line: 5 },
+      { source: 'D', target: 'E', kind: 'calls', line: 6 },
+    ];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const batches: string[][] = [];
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) => {
+        batches.push([...ids]);
+        expect(new Set(ids).size).toBe(ids.length);
+        return new Map(ids.flatMap((id) => {
+          const node = byId.get(id);
+          return node ? [[id, node] as const] : [];
+        }));
+      },
+      getOutgoingEdges: (source: string) => edges.filter((e) => e.source === source),
+    };
+
+    const path = new GraphTraverser(q as never).findPath('A', 'E');
+    expect(path?.map((step) => step.node.id)).toEqual(['A', 'B', 'D', 'E']);
+    expect(path?.map((step) => step.edge?.line ?? null)).toEqual([null, 1, 4, 6]);
+    expect(batches[0]).toEqual(['B', 'C']);
+  });
+
+  it('findPath keeps one predecessor per node instead of copying the path into the queue', () => {
+    const depth = 400;
+    const nodes = Array.from({ length: depth + 1 }, (_, i) => tNode(`n${i}`));
+    const edges: Edge[] = nodes.slice(1).map((node, i) => ({ source: `n${i}`, target: node.id, kind: 'calls' }));
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) => new Map(ids.map((id) => [id, byId.get(id)!] as const)),
+      getOutgoingEdges: (source: string) => edges.filter((e) => e.source === source),
+    };
+
+    // Count the elements array iteration walks, so no timing is involved. A
+    // queue entry that copies its path walks 1 + 2 + ... + depth of them.
+    const iterate = Array.prototype[Symbol.iterator];
+    let walked = 0;
+    let found: ReturnType<GraphTraverser['findPath']>;
+    try {
+      Array.prototype[Symbol.iterator] = function* (this: unknown[]) {
+        for (let i = 0; i < this.length; i++) { walked++; yield this[i]; }
+      } as never;
+      found = new GraphTraverser(q as never).findPath('n0', `n${depth}`);
+    } finally {
+      Array.prototype[Symbol.iterator] = iterate;
+    }
+    expect(found).toHaveLength(depth + 1);
+    expect(walked).toBeLessThan(depth * 10);
+  });
+
   it('traverseBFS keeps every parallel edge to the same target (#1090)', () => {
     // A reaches B via both `calls` and `references` — two distinct edges.
     const edges: Edge[] = [
@@ -611,5 +705,201 @@ describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
     expect(sub.edges.some((e) => e.source === 'Q' && e.target === 'M' && e.kind === 'calls')).toBe(true);
     // The regression: this direct dependency edge used to vanish.
     expect(sub.edges.some((e) => e.source === 'Q' && e.target === 'P' && e.kind === 'calls')).toBe(true);
+  });
+
+  // The issue's graph: a→t, b→a, b→t, c→b. Edge order sends the walk to b
+  // through a first, at the depth limit, before the direct b→t edge (#1974).
+  const depthNodes = ['t', 'a', 'b', 'c'].map((n) => tNode(n));
+  const depthEdges: Edge[] = [
+    { source: 'a', target: 't', kind: 'calls', line: 1 },
+    { source: 'b', target: 'a', kind: 'calls', line: 2 },
+    { source: 'b', target: 't', kind: 'calls', line: 3 },
+    { source: 'c', target: 'b', kind: 'calls', line: 4 },
+  ];
+
+  it('getImpactRadius finds a dependent within the depth even when a longer path reaches its parent first (#1974)', () => {
+    const sub = tGraph(depthNodes, depthEdges).getImpactRadius('t', 2);
+    // c → b → t is two hops. Pre-fix: b was first reached via a at depth 2 and
+    // never expanded again, so c was missing.
+    expect([...sub.nodes.keys()].sort()).toEqual(['a', 'b', 'c', 't']);
+    expect(sub.edges.some((e) => e.source === 'c' && e.target === 'b')).toBe(true);
+    // Re-expanding b does not record its incoming edges twice.
+    const keys = sub.edges.map((e) => `${e.source}>${e.target}:${e.line}`);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('getCallers at depth N finds every caller within N hops, each once (#1974)', () => {
+    const callers = tGraph(depthNodes, depthEdges).getCallers('t', 2);
+    expect(callers.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('getCallees at depth N finds every callee within N hops, each once (#1974)', () => {
+    // Mirror image: t→a, a→b, t→b, b→c. From t, b is 1 hop and c is 2.
+    const edges: Edge[] = [
+      { source: 't', target: 'a', kind: 'calls', line: 1 },
+      { source: 'a', target: 'b', kind: 'calls', line: 2 },
+      { source: 't', target: 'b', kind: 'calls', line: 3 },
+      { source: 'b', target: 'c', kind: 'calls', line: 4 },
+    ];
+    const callees = tGraph(depthNodes, edges).getCallees('t', 2);
+    expect(callees.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('getImpactRadius stops at node/edge budgets and marks truncation', () => {
+    const dependents = ['B', 'C', 'D', 'E', 'F'];
+    const nodes = [tNode('A'), ...dependents.map((id) => tNode(id))];
+    const edges: Edge[] = dependents.map((source) => ({ source, target: 'A', kind: 'calls' }));
+    const sub = tGraph(nodes, edges).getImpactRadius('A', 2, { maxNodes: 3, maxEdges: 2 });
+
+    expect(sub.nodes.size).toBe(3);
+    expect(sub.edges).toHaveLength(2);
+    expect(sub.truncated).toBe(true);
+    expect(sub.edges.every((edge) => sub.nodes.has(edge.source) && sub.nodes.has(edge.target))).toBe(true);
+  });
+
+  it('getImpactRadius reads a node\'s edges without a SQL LIMIT, and budgets after dropping contains (#3248)', () => {
+    // K is a class that contains A. B calls A, C calls B.
+    const nodes = [tNode('A'), tNode('B'), tNode('C'), tNode('K', 'class')];
+    const edges: Edge[] = [
+      { source: 'K', target: 'A', kind: 'contains', line: 1 },
+      { source: 'B', target: 'A', kind: 'calls', line: 2 },
+      { source: 'C', target: 'B', kind: 'calls', line: 3 },
+    ];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const limits: unknown[] = [];
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) =>
+        new Map(ids.flatMap((id) => (byId.has(id) ? [[id, byId.get(id)!] as const] : []))),
+      // Every read behaves like its SQL: a kind list filters, a limit caps.
+      getOutgoingEdges: (source: string, kinds?: string[], provenance?: string, limit?: number) => {
+        limits.push(limit);
+        const rows = edges.filter((e) => e.source === source && (!kinds || kinds.includes(e.kind)));
+        return limit === undefined ? rows : rows.slice(0, limit);
+      },
+      getIncomingEdges: (target: string, kinds?: string[], limit?: number) => {
+        limits.push(limit);
+        const rows = edges.filter((e) => e.target === target && (!kinds || kinds.includes(e.kind)));
+        return limit === undefined ? rows : rows.slice(0, limit);
+      },
+      getIncomingEdgesExceptContains: (...args: unknown[]) => {
+        // Any argument past the target would be a new bound on the read.
+        limits.push(args.length > 1 ? args[1] : undefined);
+        return edges.filter((e) => e.target === args[0] && e.kind !== 'contains');
+      },
+    };
+    const traverser = new GraphTraverser(q as never);
+
+    const sub = traverser.getImpactRadius('A', 3);
+    expect([...sub.nodes.keys()].sort()).toEqual(['A', 'B', 'C']);
+    expect(sub.edges.some((e) => e.kind === 'contains')).toBe(false);
+    expect(sub.truncated).toBeUndefined();
+    // The walk reads once per visited node, and a LIMIT under the reads'
+    // ORDER BY made each one markedly slower, so the budget is applied after
+    // the read instead. K is a container, so impact on it reads its members.
+    traverser.getImpactRadius('K', 2);
+    traverser.getImpactRadius('K', 2, { maxEdges: 1 });
+    expect(limits.length).toBeGreaterThan(0);
+    expect(limits.every((limit) => limit === undefined)).toBe(true);
+
+    // The contains edge is dropped before the budget applies, so it neither
+    // takes A's one edge slot nor marks the result truncated.
+    const tight = traverser.getImpactRadius('A', 1, { maxEdges: 1 });
+    expect(tight.edges.map((e) => `${e.source}>${e.target}`)).toEqual(['B>A']);
+    expect(tight.truncated).toBeUndefined();
+    // A second dependent of A is over that budget, and says so.
+    edges.push({ source: 'C', target: 'A', kind: 'calls', line: 4 });
+    const over = traverser.getImpactRadius('A', 1, { maxEdges: 1 });
+    expect(over.edges).toHaveLength(1);
+    expect(over.truncated).toBe(true);
+  });
+
+  it('surfaces impact truncation explicitly in MCP output', () => {
+    const formatted = (new ToolHandler(null) as any).formatImpact('A', {
+      nodes: new Map([['A', tNode('A')]]),
+      edges: [],
+      roots: ['A'],
+      truncated: true,
+    });
+    expect(formatted).toMatch(/truncated at safety limit/i);
+    expect(formatted).toMatch(/reduce `depth`/i);
+  });
+});
+
+describe('findPath enqueue-once (#1359)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-findpath-'));
+    fs.writeFileSync(path.join(testDir, 'graph.ts'), 'export function start() {}\n');
+    cg = CodeGraph.initSync(testDir);
+  });
+
+  afterEach(() => {
+    cg?.close();
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function seed(ids: string[], edges: Edge[]) {
+    for (const id of ids) {
+      cg['queries'].insertNode({ ...tNode(id), filePath: 'graph.ts' });
+    }
+    edges.forEach((edge, i) => cg['queries'].insertEdge({ ...edge, line: i + 1 }));
+  }
+
+  it('enqueues each dense fan-in target once while preserving the shortest path', () => {
+    const layerA = Array.from({ length: 16 }, (_, i) => `a${i}`);
+    const layerB = Array.from({ length: 16 }, (_, i) => `b${i}`);
+    const ids = ['start', ...layerA, ...layerB, 'end'];
+    const edges: Edge[] = [];
+    for (const a of layerA) {
+      edges.push({ source: 'start', target: a, kind: 'calls' });
+      for (const b of layerB) edges.push({ source: a, target: b, kind: 'calls' });
+    }
+    for (const b of layerB) edges.push({ source: b, target: 'end', kind: 'calls' });
+    seed(ids, edges);
+
+    // Count target lookups: a node is looked up only when it is first
+    // discovered and enqueued, so a repeat would mean a duplicate queue entry.
+    // No timing thresholds, and SQLite stays real.
+    const counts = new Map<string, number>();
+    const queries = cg['queries'];
+    const getNodesByIds = queries.getNodesByIds;
+    let result: ReturnType<CodeGraph['findPath']>;
+    try {
+      queries.getNodesByIds = function (ids) {
+        for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+        return getNodesByIds.call(this, ids);
+      };
+      result = cg.findPath('start', 'end', ['calls']);
+    } finally {
+      queries.getNodesByIds = getNodesByIds;
+    }
+    expect(result?.map((step) => step.node.id)).toEqual(['start', 'a0', 'b0', 'end']);
+    expect(result?.slice(1).every((step) => step.edge?.kind === 'calls')).toBe(true);
+    expect(counts).toEqual(new Map(ids.slice(1).map((id) => [id, 1])));
+  });
+
+  it('preserves shortest paths and edge filters with cycles and parallel edges', () => {
+    seed(['start', 'a', 'b', 'end', 'isolated'], [
+      { source: 'start', target: 'start', kind: 'calls' },
+      { source: 'start', target: 'a', kind: 'calls' },
+      { source: 'start', target: 'a', kind: 'calls' },
+      { source: 'a', target: 'start', kind: 'calls' },
+      { source: 'a', target: 'b', kind: 'calls' },
+      { source: 'b', target: 'end', kind: 'calls' },
+      { source: 'start', target: 'end', kind: 'references' },
+    ]);
+    const result = cg.findPath('start', 'end', ['calls']);
+    expect(result?.map((step) => step.node.id)).toEqual(['start', 'a', 'b', 'end']);
+    expect(result?.[1].edge?.line).toBe(2);
+    expect(cg.findPath('start', 'end')?.map((step) => step.node.id)).toEqual(['start', 'end']);
+    expect(cg.findPath('start', 'start')?.map((step) => step.node.id)).toEqual(['start']);
+    expect(cg.findPath('start', 'isolated')).toBeNull();
+    expect(cg.findPath('missing', 'end')).toBeNull();
+    expect(cg.findPath('start', 'missing')).toBeNull();
+    expect(cg.findPath('missing', 'missing')).toBeNull();
+    expect(cg.findPath('start', 'end', ['imports'])).toBeNull();
   });
 });

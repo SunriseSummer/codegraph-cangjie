@@ -1,8 +1,9 @@
 # Anonymous usage telemetry
 
-Status: implemented — ingest Worker (`telemetry-worker/`), client (`src/telemetry/`),
-`codegraph telemetry` CLI, MCP + installer wiring, `TELEMETRY.md`. Pending: Worker deploy
-+ DNS, release.
+Status: implemented — client (`src/telemetry/`), `codegraph telemetry` CLI, MCP + installer
+wiring, `TELEMETRY.md`, ingest Worker (`telemetry-worker/`) storing to its own Cloudflare D1
+database, nightly rollup + retention cron, and the admin dashboard Worker
+(`telemetry-dashboard/`).
 Scope: public `codegraph` engine (CLI + MCP server + installer)
 
 CodeGraph is a local-first tool whose whole pitch is "your code never leaves your machine."
@@ -26,7 +27,10 @@ Answer, in aggregate and anonymously:
 
 - **No source code, ever.** No file paths, file names, repo names, symbol names, query
   strings, search terms, or anything derived from the contents of an indexed project.
-- No IP addresses (stripped at the edge; storage disabled at the backend too).
+- No IP addresses — never read at the edge, and there is no downstream backend that could
+  see one.
+- No third-party analytics vendor. Events are stored only in our own database; the ingest
+  Worker makes no outbound requests at all.
 - No hardware fingerprinting — the machine ID is a random UUID, not derived from anything.
 - No per-keystroke / per-call event stream — usage is aggregated locally into daily rollups
   before anything is sent.
@@ -37,8 +41,8 @@ Answer, in aggregate and anonymously:
 1. **The schema is the allowlist.** Client sends only the events below; the ingest Worker
    validates against the same allowlist and drops anything else. Adding a field = PR that
    edits this doc + `TELEMETRY.md` + the Worker allowlist together.
-2. **Telemetry may never cost the user anything**: zero added latency on the MCP tool-call
-   hot path (the repo's core invariant), zero new npm dependencies (global `fetch`, Node ≥18),
+2. **Telemetry may never cost the user anything**: no network requests or queue writes on the MCP tool-call
+   hot path (only a small local consent-file read), zero new npm dependencies (global `fetch`, Node ≥18),
    zero bytes on stdout (stdio is the MCP protocol channel), zero retries, zero error noise.
    Every failure mode is silence.
 3. **Off is off.** When disabled, no process opens a socket to the telemetry endpoint — not
@@ -49,7 +53,7 @@ Answer, in aggregate and anonymously:
 
 ## Events
 
-Common envelope on every batch (computed once per process):
+Common envelope on every batch (identity revalidated before each request):
 
 | field | example | notes |
 |---|---|---|
@@ -58,7 +62,7 @@ Common envelope on every batch (computed once per process):
 | `os` / `arch` | `darwin` / `arm64` | `process.platform` / `process.arch` |
 | `node_major` | `22` | major only |
 | `ci` | `false` | `CI` env var present |
-| `schema_version` | `1` | bump when the schema changes |
+| `schema_version` | `2` | bump when the schema changes (v2 dropped `index.sqlite_backend`) |
 
 Event types:
 
@@ -70,13 +74,13 @@ Event types:
 - **`usage_rollup`** — the workhorse. One event per `(day, kind, name)` per machine,
   aggregated locally. Props: `kind` (`mcp_tool`/`cli_command`), `name`
   (e.g. `codegraph_explore`, `affected`), `count`, `error_count`, and for MCP:
-  `client_name`/`client_version` from the `initialize` handshake (`src/mcp/session.ts`
-  `case 'initialize'` — plumbing to add; currently unread).
+  `client_name`/`client_version` captured from the `initialize` handshake
+  (`src/mcp/session.ts`) and passed through on every `recordUsage` call.
   The prompt hook additionally rolls up its gate DECISION as `cli_command`
   counters named `prompt-hook-gate-<outcome>`, outcome ∈ `high-keyword` /
   `high-token` / `medium-segment` / `nudge-projects` / `noop-shape` /
   `noop-no-index` / `noop-unverified` / `noop-explore-keyword` /
-  `noop-explore-token` / `noop-vocab-empty` — decision names only, never
+  `noop-explore-token` / `noop-vocab-empty` / `noop-rebuild` — decision names only, never
   prompt content. This is the gate's measured recall/precision funnel: a
   rising `noop-*` share against the `high`/`medium` tiers is the signal that
   the gate (keyword table or segment matching) is missing real questions.
@@ -85,15 +89,27 @@ Event types:
   `noop-explore-<trigger>` instead (#1143), and a MEDIUM-eligible prompt
   hitting a not-yet-backfilled segment vocabulary records `noop-vocab-empty`
   rather than polluting `noop-unverified` (#1142).
+  A prompt that arrives while `codegraph index` rebuilds the project records
+  `noop-rebuild`: the hook leaves a rebuilding index alone (#2913).
 - **`uninstall`** — one per `uninstall`/`uninit` run (churn signal). Props: `targets`.
 
-Volume math: rollups mean monthly events ≈ active machines × active days × distinct
-tools used (single digits) — the PostHog free tier (1M events/mo) covers tens of
-thousands of MAU. There is no per-call event by design.
+One legacy field is still *accepted* and belongs in the mirror even though nothing sends
+it: `sqlite_backend` (`native`/`wasm`) on `install` and `index`. Pre-schema-v2 clients
+(≤ June 2026) sent it; `node:sqlite` is the only backend now, so current clients omit it.
+It is never `required`, and it is safe to drop from the Worker once those clients'
+share is negligible.
 
-Events are sent as PostHog **anonymous events** (`$process_person_profile: false`):
-cheaper, no person profiles, unique-machine counts still work on `distinct_id` =
-`machine_id`. Revisit only if retention tooling demands profiles.
+Volume math: rollups mean monthly events ≈ active machines × active days × distinct tools
+used (single digits) — there is no per-call event by design. At ~97k accepted POSTs/day
+that is ≈30M D1 row writes/month against the 50M included on **Workers Paid**, roughly
+doubling to ≈48M once the retention purge reaches steady state (a delete bills like an
+insert). Storage is the binding constraint, not writes: raw events grow ≈74 MB/day, so the
+90-day window lands at ≈6.7 GB against D1's 10 GB per-database cap — which is what sets the
+window. Full arithmetic and the remaining levers are in the migration's footer comment.
+
+There are no person profiles to opt out of: `machine_id` is the only identifier that exists
+anywhere in the system, it is a client-minted random UUID, and unique-machine counts are
+computed from it directly in SQL.
 
 ## Consent & controls
 
@@ -117,7 +133,12 @@ Surfaces:
   `codegraph collects anonymous usage stats (no code or paths) — "codegraph telemetry off" or CODEGRAPH_TELEMETRY=0 disables. Details: TELEMETRY.md`
 - **CLI:** `codegraph telemetry status|on|off` (status prints the machine ID, current
   state, and what decided it). Deleting `~/.codegraph/telemetry.json` resets everything,
-  including the machine ID.
+  including the machine ID. Turning telemetry off stores a null `machine_id` and removes
+  both queued and claimed unsent data. Turning it back on mints a new ID; processes
+  discard memory from the previous identity even if they missed the off/on transition.
+  Requests already in flight cannot be recalled, but every later request chunk and
+  requeue checks current consent and identity again. Config writes use atomic replacement
+  so concurrent readers never see a half-written choice.
 
 `~/.codegraph/telemetry.json`:
 
@@ -140,7 +161,8 @@ other filenames.)
 New module `src/telemetry/` (single small module, no deps):
 
 - **Counters in memory** — recording a tool call/CLI command is an in-memory increment.
-  Nothing on the hot path touches disk or network. MCP tool handlers call
+  The small consent file is refreshed before recording so another process's opt-out is
+  observed. No queue writes or network requests run on this path. MCP tool handlers call
   `telemetry.count('mcp_tool', name, ok)` and move on.
 - **Buffer** — counters persist (debounced, async) to `~/.codegraph/telemetry-queue.jsonl`.
   Hard cap ~256 KB; on overflow drop oldest lines. Corrupt buffer → truncate, never throw.
@@ -166,15 +188,61 @@ public on purpose, so anyone can audit exactly what the endpoint stores. It ship
 with the npm package (excluded by the `files` allowlist):
 
 - `POST /v1/events`: validate against the event/property allowlist (drop unknown events,
-  strip unknown props), enforce sane sizes, **never forward or log the client IP**
-  (drop `CF-Connecting-IP`), light per-`machine_id` rate limit so abuse can't burn the
-  ingest cap, forward to `https://us.i.posthog.com/batch/` with the project key from a
-  Worker secret. Responds `204` on accept (including events dropped by the allowlist)
-  and honest `4xx` for malformed/oversized/rate-limited requests — the client treats
-  every response as final and never retries.
-- Backend today: PostHog Cloud US, free plan, "discard client IP" enabled, GeoIP disabled,
-  autocapture/replay/heatmaps/web-vitals all off. The Worker is the seam: swapping the
-  backend later is a Worker change, not a client release.
+  strip unknown props), enforce sane sizes, **never read or log the client IP**, light
+  per-`machine_id` rate limit so abuse can't burn the ingest cap, then write the survivors
+  to D1. Responds `204` on accept (including events dropped by the allowlist) and honest
+  `4xx` for malformed/oversized/rate-limited requests — the client treats every response
+  as final and never retries.
+- **Storage: our own Cloudflare D1 database** (`codegraph-telemetry`, bound as `env.DB`).
+  The Worker makes **no outbound requests** — nothing is forwarded to a third-party
+  analytics vendor, so there is no vendor-side privacy setting to get wrong and no second
+  copy of the data anywhere. The complete stored schema is
+  [`telemetry-worker/migrations/`](../../telemetry-worker/migrations/),
+  checked in for the same reason the Worker's source is public.
+- The write is off the response path (`ctx.waitUntil`, one `batch()` = one transaction) and
+  deliberately **fail-silent**: a D1 error is logged as counts only, never the payload, and
+  the client still gets its `204`. Clients never retry, so losing a datapoint beats losing
+  availability.
+- **Nightly cron (00:30 UTC, `src/rollup.ts`)** rolls each finished day into anonymous daily
+  counts (`daily_machines`, `daily_event_counts`, `daily_dim_counts`) and re-runs the two
+  days before it, since offline clients ship completed-day rollups late. Aggregation is
+  `INSERT … SELECT … ON CONFLICT DO UPDATE` inside D1 — no event row crosses the wire, and
+  re-running a day is a no-op rather than a double count. Usage counters are stored one
+  row per machine × day × tool (`usage_daily`), each upload adding to its row, so storage
+  does not depend on how often a client uploads. The same job **purges raw `events` and
+  `usage_daily` rows older than `RETENTION_DAYS`** (90; a var in `wrangler.jsonc`). Rollups and
+  `machine_days`/`machine_first_seen` are kept forever, so shortening the window costs
+  ad-hoc drill-back, never a chart.
+- The Worker remains the seam: changing storage later is a Worker change, not a client
+  release. The client only ever knows the domain.
+
+Operational detail — deploy, migrations, the cron, the `POST /admin/rollup` backfill hatch,
+and the D1 quota arithmetic — lives in
+[`telemetry-worker/README.md`](../../telemetry-worker/README.md).
+
+## Admin dashboard (Cloudflare Worker)
+
+`stats.getcodegraph.com` → a second Worker at
+[`telemetry-dashboard/`](../../telemetry-dashboard/) — the read side, and the reason
+self-hosting the data costs us no analysis capability. Also public source, for the same
+reason: the code that touches telemetry should be readable by the people it collects from.
+Full documentation is [`telemetry-dashboard/README.md`](../../telemetry-dashboard/README.md).
+
+- **Same D1 database, read-only.** It never migrates and never writes; schema changes belong
+  to the ingest Worker. The two Workers are separate deployments that agree on a list of
+  dimension names by convention alone, which is exactly the seam
+  `telemetry-worker/scripts/smoke-cutover.sh` exists to cover — a mismatch there is silent,
+  showing up as a panel that reads zero forever rather than as an error.
+- **Reads rollups, not raw events**, so a chart stays correct for days whose raw rows have
+  been purged. The activation funnel's "did this machine ever run an index" is not a daily
+  aggregate, so it reads `machine_first_seen.first_index_day` instead, which the ingest Worker
+  lowers as each index event is stored and the nightly cron re-derives from raw `events`.
+- **Auth is a shared password and a signed cookie**, sized for exactly two people:
+  `ADMIN_PASSWORD` + `SESSION_SECRET` as Worker secrets, constant-time compare, HMAC-signed
+  cookie with no session store, everything except `/login` and `robots.txt` gated. Rotating
+  the password signs everyone out; that is the revocation story.
+- This Worker *does* read the client IP, solely as a login rate-limit key, never stored or
+  logged — the one deliberate difference from the ingest Worker, which never reads it at all.
 
 ## codegraph-pro rule (do not lose this in upstream merges)
 
@@ -187,9 +255,9 @@ CLAUDE.md and must survive every upstream merge.
 ## Rollout
 
 1. This doc + repo-root `TELEMETRY.md` (user-facing field-by-field list) + README section.
-2. Worker + DNS live first (so the first shipping client never 404s), PostHog dashboards:
-   weekly active machines, installs by target, usage by tool × client, version adoption,
-   languages indexed.
+2. Worker + DNS live first (so the first shipping client never 404s), then the dashboard
+   Worker over the same D1: weekly active machines, installs by target, usage by
+   tool × client, version adoption, languages indexed.
 3. Client module + config + `codegraph telemetry` subcommand + MCP `clientInfo` plumbing.
 4. Installer toggle + first-run notice. CHANGELOG entry under `[Unreleased]` announcing
    telemetry, the default, and every off-switch. Release.

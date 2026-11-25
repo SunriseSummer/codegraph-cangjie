@@ -7,11 +7,12 @@ import { extractFromSource } from '../src/extraction';
 import { resetKernelForTests, tryKernelExtract } from '../src/extraction/kernel';
 import type { ExtractionResult, Node } from '../src/types';
 
-const TEST_ROOT = path.resolve(__dirname, '..', '..', '.test');
+const TEST_ROOT = path.resolve(__dirname, 'fixtures', 'cangjie-1.0.6');
 const PROJECT_NAMES = [
   'codegraph-feature-matrix',
   'codegraph-import-boundaries',
   'codegraph-concurrency',
+  'codegraph-values',
 ] as const;
 const PROJECT_ROOTS = PROJECT_NAMES.map((name) => path.join(TEST_ROOT, name));
 const KERNEL_PATH = path.join(
@@ -22,7 +23,6 @@ const KERNEL_PATH = path.join(
   `${process.platform}-${process.arch}`,
   'codegraph-kernel.node'
 );
-const corpusAvailable = PROJECT_ROOTS.every((root) => fs.existsSync(root));
 const kernelBuilt = fs.existsSync(KERNEL_PATH);
 
 function sourceFiles(root: string): string[] {
@@ -73,7 +73,7 @@ function oneByQualifiedName(graph: CodeGraph, qualifiedName: string): Node {
   return matches[0]!;
 }
 
-describe.skipIf(!corpusAvailable)('Cangjie 1.0.5 executable project corpus', () => {
+describe('Cangjie 1.0.6 executable project corpus', () => {
   beforeAll(async () => {
     await loadGrammarsForLanguages(['cangjie']);
   });
@@ -104,7 +104,7 @@ describe.skipIf(!corpusAvailable)('Cangjie 1.0.5 executable project corpus', () 
   }
 });
 
-describe.skipIf(!corpusAvailable)('Cangjie project-level boundary resolution', () => {
+describe('Cangjie project-level boundary resolution', () => {
   let temporaryRoot = '';
   let graph: CodeGraph | undefined;
 

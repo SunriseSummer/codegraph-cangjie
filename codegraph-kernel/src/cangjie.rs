@@ -1,4 +1,4 @@
-//! Cangjie 1.0.5 native extraction.
+//! Cangjie 1.0.6 native extraction.
 //!
 //! This walker mirrors `src/extraction/languages/cangjie.ts` and the Cangjie
 //! branches in `tree-sitter.ts`. The grammar is compiled from the same
@@ -11,7 +11,7 @@ use crate::buffers::{
 use crate::docstring::preceding_docstring;
 use crate::ids;
 use crate::textutil as util;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
 #[derive(Default)]
@@ -44,6 +44,7 @@ struct Walker<'t> {
     arena: Arena,
     tables: Tables,
     stack: Vec<Scope>,
+    block_bindings: HashMap<usize, HashMap<String, usize>>,
 }
 
 pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
@@ -53,9 +54,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language(cangjie) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     if tree.root_node().has_error() {
         return Err("defer: Cangjie parse tree contains errors".to_string());
     }
@@ -67,6 +66,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         arena: Arena::default(),
         tables: Tables::default(),
         stack: Vec::new(),
+        block_bindings: HashMap::new(),
     };
 
     let line_count = source.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
@@ -192,6 +192,7 @@ impl<'t> Walker<'t> {
     }
 
     fn first_descendant_kind(&self, node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
+        stack_guard!();
         if kinds.contains(&node.kind()) {
             return Some(node);
         }
@@ -204,6 +205,84 @@ impl<'t> Walker<'t> {
             }
         }
         None
+    }
+
+    fn pattern_binds(&self, pattern: Option<Node<'t>>, name: &str) -> bool {
+        let Some(pattern) = pattern else { return false };
+        let mut names = Vec::new();
+        self.collect_binding_names(pattern, &mut names);
+        names.iter().any(|bound| bound == name)
+    }
+
+    /// Same lexical shadow check as cangjieHasLocalValueBinding in the TS path.
+    fn locally_bound(&mut self, node: Node<'t>, name: &str) -> bool {
+        let mut child = node;
+        let mut budget = 10_000usize;
+        while let Some(parent) = child.parent() {
+            if budget == 0 { return true }
+            budget -= 1;
+            if parent.kind() == "block" {
+                if !self.block_bindings.contains_key(&parent.start_byte()) {
+                    let mut declarations = HashMap::new();
+                    for i in 0..parent.named_child_count() {
+                        let Some(sibling) = parent.named_child(i) else { continue };
+                        if sibling.kind() != "variableDeclaration" { continue }
+                        if let Some(pattern) = sibling.child_by_field_name("name") {
+                            let mut names = Vec::new();
+                            self.collect_binding_names(pattern, &mut names);
+                            for bound in names {
+                                declarations.entry(bound).or_insert(sibling.start_byte());
+                            }
+                        }
+                    }
+                    self.block_bindings.insert(parent.start_byte(), declarations);
+                }
+                if self.block_bindings.get(&parent.start_byte()).and_then(|declarations| declarations.get(name)).is_some_and(|at| *at <= node.start_byte()) {
+                    return true;
+                }
+            }
+            if let Some(parameters) = self.first_direct_kind(parent, &["parameterList", "primaryInitParamList"]) {
+                let mut pending = vec![parameters];
+                while let Some(parameter) = pending.pop() {
+                    if budget == 0 { return true }
+                    budget -= 1;
+                    if let Some(identifier) = parameter.child_by_field_name("paraName") {
+                        if self.text(identifier) == name { return true }
+                    } else {
+                        for i in 0..parameter.named_child_count() {
+                            if let Some(n) = parameter.named_child(i) { pending.push(n) }
+                        }
+                    }
+                }
+            }
+            if parent.kind() == "lambdaExpression" && self.pattern_binds(self.first_direct_kind(parent, &["lambdaParameters"]), name) { return true }
+            if parent.kind() == "forInExpression" && child.kind() == "block" && self.pattern_binds(parent.named_child(0), name) { return true }
+            if parent.kind() == "matchCase" {
+                if let Some(pattern) = parent.named_child(0) {
+                    if node.start_byte() >= pattern.end_byte() && self.pattern_binds(Some(pattern), name) { return true }
+                }
+            }
+            if parent.kind() == "ifExpression" && child.kind() == "block" {
+                if let Some(pattern) = parent.named_child(0) {
+                    if pattern.kind().ends_with("Pattern") && self.pattern_binds(Some(pattern), name) { return true }
+                }
+            }
+            if parent.kind() == "tryExpression" {
+                if let Some(pattern) = child.prev_named_sibling() {
+                    if pattern.kind() == "catchPattern" && self.pattern_binds(Some(pattern), name) { return true }
+                }
+            }
+            child = parent;
+        }
+        false
+    }
+
+    fn extract_value_read(&mut self, node: Node<'t>) {
+        let Some(parent) = node.parent() else { return };
+        if parent.kind() == "fieldAccess" || (parent.kind() == "postfixExpression" && node.next_named_sibling().is_some()) { return }
+        let name = self.atomic_name(node);
+        if name.is_empty() || name == "_" || self.locally_bound(node, &name) { return }
+        self.push_ref_at(self.top_row(), &name, "references", node);
     }
 
     fn body_of(&self, node: Node<'t>) -> Option<Node<'t>> {
@@ -616,6 +695,7 @@ impl<'t> Walker<'t> {
     }
 
     fn visit_node(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         let mut skip_children = false;
         match kind {
@@ -676,6 +756,7 @@ impl<'t> Walker<'t> {
                 self.extract_operator_call(node)
             }
             "fieldAccess" => self.extract_field_read(node),
+            "atomicVariable" => self.extract_value_read(node),
             _ => {}
         }
         if !skip_children {
@@ -688,12 +769,14 @@ impl<'t> Walker<'t> {
     }
 
     fn walk_body(&mut self, node: Node<'t>) {
+        stack_guard!();
         match node.kind() {
             "callSuffix" | "trailingLambdaExpression" => self.extract_call(node),
             "binaryExpression" | "unaryExpression" | "indexAccess" => {
                 self.extract_operator_call(node)
             }
             "fieldAccess" => self.extract_field_read(node),
+            "atomicVariable" => self.extract_value_read(node),
             "functionDefinition"
             | "mainDefinition"
             | "macroDefinition"
@@ -955,6 +1038,7 @@ impl<'t> Walker<'t> {
     }
 
     fn collect_binding_names(&self, node: Node<'t>, names: &mut Vec<String>) {
+        stack_guard!();
         if node.kind() == "varBindingPattern" {
             let name = self.text(node).trim();
             if !name.is_empty() && name != "_" {
@@ -1048,6 +1132,7 @@ impl<'t> Walker<'t> {
     }
 
     fn collect_import_entries(&self, node: Node<'t>) -> Vec<ImportEntry> {
+        stack_guard!();
         let mut entries = Vec::new();
         let mut field_cursor = node.walk();
         for package in node.children_by_field_name("packageName", &mut field_cursor) {
@@ -1167,6 +1252,7 @@ impl<'t> Walker<'t> {
     }
 
     fn call_argument_type(&self, argument: Node<'t>) -> Option<String> {
+        stack_guard!();
         let text = self.text(argument).trim();
         match argument.kind() {
             "integerLiteral" => {
@@ -1432,12 +1518,15 @@ impl<'t> Walker<'t> {
         if node.kind() == "trailingLambdaExpression" && previous.kind() == "callSuffix" {
             return;
         }
-        let candidates = self.call_shape_hints(node);
+        let mut candidates = self.call_shape_hints(node);
         match previous.kind() {
             "atomicVariable" => {
                 let name = self.atomic_name(previous);
                 if name.is_empty() {
                     return;
+                }
+                if self.locally_bound(previous, &name) {
+                    candidates.push("@cangjie/local-value".to_string());
                 }
                 self.push_ref_with_candidates(
                     caller,

@@ -16,6 +16,20 @@
 
 #![deny(clippy::all)]
 
+/// First statement of every recursive walker function (see stack.rs, #1581):
+/// once the stack pointer is inside the red zone, stop descending — the
+/// latched flag makes `stack::run_guarded` discard the walk and defer the
+/// file to wasm. `Default::default()` covers every walker return type in use
+/// (`()`, `bool`, `Option<_>`, `String`); a hook returning `false` just sends
+/// its caller down the generic child walk, whose own guard returns at once.
+macro_rules! stack_guard {
+    () => {
+        if $crate::stack::exhausted() {
+            return ::core::default::Default::default();
+        }
+    };
+}
+
 mod buffers;
 mod cangjie;
 mod ccpp;
@@ -29,11 +43,13 @@ mod java;
 mod kotlin;
 mod langs;
 mod lua;
+mod parse_budget;
 mod php;
 mod rlang;
 mod ruby;
 mod rustlang;
 mod scala;
+mod stack;
 mod swift;
 mod textutil;
 mod python;
@@ -216,25 +232,37 @@ pub fn cfnptr_strip_c(text: String) -> String {
 }
 
 #[napi]
-pub fn extract_file(file_path: String, content: String, language: String) -> Result<ExtractBuffers> {
-    let out = match language.as_str() {
-        "java" => java::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "python" => python::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "go" => go::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "c" | "cpp" => ccpp::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
-        "rust" => rustlang::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "csharp" => csharp::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "ruby" => ruby::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "php" => php::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "swift" => swift::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "kotlin" => kotlin::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "r" => rlang::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "lua" | "luau" => lua::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
-        "scala" => scala::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "dart" => dart::extract(&file_path, &content).map_err(Error::from_reason)?,
-        "cangjie" => cangjie::extract(&file_path, &content).map_err(Error::from_reason)?,
-        _ => tsjs::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
-    };
+pub fn extract_file(
+    file_path: String,
+    content: String,
+    language: String,
+    parse_budget_ms: Option<u32>,
+) -> Result<ExtractBuffers> {
+    // The whole walk runs under the stack guard (stack.rs, #1581): a file
+    // nested deeply enough to overflow this thread's stack comes back as a
+    // `defer:` error — the TS side's routine "take the wasm path" signal —
+    // instead of a SIGSEGV that kills the entire indexer process. And its
+    // parse is cancelled past `parse_budget_ms` (parse_budget.rs, #3274), a
+    // `timeout:` error, instead of a thread that spins until the process dies.
+    let out = parse_budget::with_budget(parse_budget_ms, || stack::run_guarded(|| match language.as_str() {
+        "java" => java::extract(&file_path, &content),
+        "python" => python::extract(&file_path, &content),
+        "go" => go::extract(&file_path, &content),
+        "c" | "cpp" => ccpp::extract(&file_path, &content, &language),
+        "rust" => rustlang::extract(&file_path, &content),
+        "csharp" => csharp::extract(&file_path, &content),
+        "ruby" => ruby::extract(&file_path, &content),
+        "php" => php::extract(&file_path, &content),
+        "swift" => swift::extract(&file_path, &content),
+        "kotlin" => kotlin::extract(&file_path, &content),
+        "r" => rlang::extract(&file_path, &content),
+        "lua" | "luau" => lua::extract(&file_path, &content, &language),
+        "scala" => scala::extract(&file_path, &content),
+        "dart" => dart::extract(&file_path, &content),
+        "cangjie" => cangjie::extract(&file_path, &content),
+        _ => tsjs::extract(&file_path, &content, &language),
+    }))
+    .map_err(Error::from_reason)?;
     Ok(ExtractBuffers {
         meta: out.meta.into(),
         nodes: out.nodes.into(),

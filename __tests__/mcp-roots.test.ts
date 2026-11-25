@@ -21,33 +21,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import {
-  NODE_RUNTIME_FLAGS,
-  WASM_RUNTIME_FLAGS,
-} from '../src/extraction/wasm-runtime-flags';
+import { once } from 'events';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   // --no-watch keeps the test deterministic and avoids watcher startup noise.
-  return spawn(
-    process.execPath,
-    [
-      ...WASM_RUNTIME_FLAGS,
-      ...NODE_RUNTIME_FLAGS,
-      BIN,
-      'serve',
-      '--mcp',
-      '--no-watch',
-    ],
-    {
-      cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      // roots/list is an in-process session contract. Detached-daemon behavior
-      // is covered separately and would keep the Windows temp index open.
-      env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
-    }
-  ) as ChildProcessWithoutNullStreams;
+  return spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp', '--no-watch'], {
+    cwd,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }) as ChildProcessWithoutNullStreams;
 }
 
 /** Parse every JSON-RPC message the server writes to stdout into an array. */
@@ -103,19 +87,14 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
   });
 
   afterEach(async () => {
-    const runningChild = child;
-    child = null;
-    if (
-      runningChild &&
-      runningChild.exitCode === null &&
-      runningChild.signalCode === null
-    ) {
-      const exited = new Promise<void>((resolve) => {
-        runningChild.once('exit', () => resolve());
-      });
-      runningChild.kill('SIGKILL');
-      await exited;
+    // Spawn with the runtime flags so this is the server, not a relauncher
+    // whose grandchild would retain the Windows cwd/database handles.
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = once(child, 'close');
+      child.kill('SIGKILL');
+      await closed;
     }
+    child = null;
     fs.rmSync(cwdDir, { recursive: true, force: true });
     fs.rmSync(projectDir, { recursive: true, force: true });
   });

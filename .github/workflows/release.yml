@@ -19,6 +19,10 @@ name: Release
 on:
   workflow_dispatch: {}
 
+concurrency:
+  group: cangjie-release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write      # create the GitHub Release + tag
   id-token: write      # OIDC token for npm --provenance and Sigstore signing
@@ -40,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
           - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
             targets: x86_64-unknown-linux-gnu
@@ -51,6 +55,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
       - name: Build kernel prebuilds
         shell: bash
         run: |
@@ -58,6 +65,13 @@ jobs:
             bash scripts/build-kernel.sh --target "$t"
           done
           ls -R codegraph-kernel/prebuilds
+      - run: npm ci
+      - name: Native Cangjie parity and resolution on this runner
+        shell: bash
+        run: |
+          CODEGRAPH_KERNEL_EXPECT=1 npx vitest run \
+            __tests__/kernel-cangjie-parity.test.ts \
+            __tests__/cangjie-*.test.ts --maxWorkers=2
       - uses: actions/upload-artifact@v7
         with:
           name: kernel-${{ matrix.runner }}
@@ -70,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -82,8 +96,8 @@ jobs:
       - name: Verify committed release metadata
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF_TYPE" = "branch" ] && [ "$GITHUB_REF_NAME" = "cangjie-1.0.5" ] || {
-            echo "::error::Run this release workflow from the cangjie-1.0.5 branch"
+          [ "$GITHUB_REF_TYPE" = "branch" ] && [ "$GITHUB_REF_NAME" = "cangjie-1.0.6" ] || {
+            echo "::error::Run this release workflow from the cangjie-1.0.6 branch"
             exit 1
           }
           PKG_V=$(node -p "require('./package.json').version")
@@ -115,7 +129,23 @@ jobs:
           merge-multiple: true
           path: release/kernel/
 
-      - name: Kernel contract + full walker-parity gate
+      - name: Install verified Cangjie 1.0.6 test toolchain
+        run: |
+          set -euo pipefail
+          SDK_DIR="$RUNNER_TEMP/cangjie-sdk-1.0.6"
+          mkdir -p "$SDK_DIR"
+          curl --fail --location --retry 3 \
+            'https://cangjie-lang.cn/v1/files/auth/downLoad?nsId=142267&fileName=cangjie-sdk-linux-x64-1.0.6.tar.gz&objectKey=6afec29905b3c57676e0280e' \
+            --output "$SDK_DIR/sdk.tar.gz"
+          echo "47893d081695fd21f8ecf6c4d6b2f6d15109d864576f8857db2556d148e98c7e  $SDK_DIR/sdk.tar.gz" | sha256sum --check
+          tar -xzf "$SDK_DIR/sdk.tar.gz" -C "$SDK_DIR"
+          source "$SDK_DIR/cangjie/envsetup.sh"
+          cjc --version
+          cjpm --version
+          printf '%s\n' "$CANGJIE_HOME/bin" "$CANGJIE_HOME/tools/bin" >> "$GITHUB_PATH"
+          printf 'CANGJIE_HOME=%s\nLD_LIBRARY_PATH=%s\n' "$CANGJIE_HOME" "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+      - name: Full regression + native/WASM + compiler gate
         # Runs EVERY kernel suite (__tests__/kernel-*.test.ts — the wire
         # contract, the grammar-source parity table checks, and all 20
         # languages' walker byte-parity suites incl. torture/CRLF/defer pins)
@@ -127,7 +157,7 @@ jobs:
           if [ -f release/kernel/linux-x64/codegraph-kernel.node ]; then
             mkdir -p codegraph-kernel/prebuilds/linux-x64
             cp release/kernel/linux-x64/codegraph-kernel.node codegraph-kernel/prebuilds/linux-x64/
-            CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-*.test.ts
+            CANGJIE_TEST_TOOLCHAIN=1 CODEGRAPH_KERNEL_EXPECT=1 npm test -- --maxWorkers=4
           else
             echo "::error::linux-x64 kernel prebuild missing despite required matrix"
             exit 1
@@ -178,7 +208,7 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release/codegraph-* release/SHA256SUMS --clobber
           else
-            gh release create "$TAG" release/codegraph-* release/SHA256SUMS --title "$TAG" --notes-file notes.md
+            gh release create "$TAG" release/codegraph-* release/SHA256SUMS --target "${{ github.sha }}" --title "$TAG" --notes-file notes.md
           fi
 
       - name: Publish to npm
@@ -277,15 +307,25 @@ jobs:
           set -euo pipefail
           V="${{ steps.ver.outputs.version }}"
           # npm publish can print success without persisting; confirm against the
-          # registry (with retries for propagation) so green means really shipped.
+          # registry so green means really shipped. npm can take a while to show
+          # a version it has accepted: 1.6.1's packages took longer than the old
+          # 60 s, and 1.6.3's darwin-arm64 and win32-arm64 packages took about
+          # 13 minutes ("Your package is being processed"), which failed the old
+          # 5-minute wait although every package had shipped. So the whole step
+          # shares one 30-minute deadline, and each check uses --prefer-online
+          # so a copy in npm's local cache can't hide a version that's there.
+          start=$(date +%s)
+          deadline=$(( start + 30 * 60 ))
           for dir in release/npm/codegraph-* release/npm/main; do
             name=$(node -p "require('./$dir/package.json').name")
-            ok=
-            for i in 1 2 3 4 5 6; do
-              if npm view "$name@$V" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then ok=1; break; fi
-              echo "waiting for $name@$V to appear ($i)…"; sleep 10
+            until npm view "$name@$V" version --prefer-online >/dev/null 2>&1; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::$name@$V never appeared on the registry (waited 30 minutes)"
+                exit 1
+              fi
+              echo "waiting for $name@$V to appear ($(( $(date +%s) - start ))s)…"
+              sleep 15
             done
-            [ -n "$ok" ] || { echo "::error::$name@$V never appeared on the registry"; exit 1; }
             echo "verified $name@$V"
           done
 

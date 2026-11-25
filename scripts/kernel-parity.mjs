@@ -68,7 +68,7 @@ const EXTS = new Map([
   ['.lua', 'lua'], ['.luau', 'luau'], // R7b batch 4
   ['.scala', 'scala'], ['.sc', 'scala'], // R7b batch 4
   ['.dart', 'dart'], // R7b batch 4
-  ['.cj', 'cangjie'], // Cangjie 1.0.5
+  ['.cj', 'cangjie'], // Cangjie 1.0.6
 ]);
 
 /** Collect candidate files. */
@@ -89,9 +89,12 @@ function collect(p, out) {
     const lang = EXTS.get(path.extname(p).toLowerCase());
     // 'detect' (.h) resolves per file in the run loop; under --lang it rides
     // along whenever either C-family language is requested.
+    // A Flow-typed `.js` routes as tsx (detectLanguage reads its pragma), so
+    // it rides along when tsx is requested and is re-detected per file below.
     const passes =
       !langFilter ||
-      (lang === 'detect' ? langFilter.has('c') || langFilter.has('cpp') : langFilter.has(lang));
+      (lang === 'detect' ? langFilter.has('c') || langFilter.has('cpp') : langFilter.has(lang)) ||
+      ((lang === 'javascript' || lang === 'jsx') && langFilter.has('tsx'));
     if (passes) out.push({ file: p, lang });
   }
 }
@@ -104,10 +107,11 @@ if (files.length === 0) {
 }
 
 // --- load the built engine ---------------------------------------------------
-const distUrl = (p) => pathToFileURL(dist(p)).href;
-const { extractFromSource } = await import(distUrl('extraction/tree-sitter.js'));
-const { initGrammars, loadGrammarsForLanguages, detectLanguage } = await import(distUrl('extraction/grammars.js'));
-const kernel = await import(distUrl('extraction/kernel/index.js'));
+// As file:// URLs: import() rejects a bare `C:\...` path on Windows
+// (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+const { extractFromSource } = await import(pathToFileURL(dist('extraction/tree-sitter.js')).href);
+const { initGrammars, loadGrammarsForLanguages, detectLanguage } = await import(pathToFileURL(dist('extraction/grammars.js')).href);
+const kernel = await import(pathToFileURL(dist('extraction/kernel/index.js')).href);
 
 await initGrammars();
 await loadGrammarsForLanguages([...KERNEL_LANGS]);
@@ -197,8 +201,12 @@ process.env.CODEGRAPH_KERNEL_LANGS = 'all';
 for (const { file, lang: extLang } of files) {
   const source = fs.readFileSync(file, 'utf8');
   const rel = path.relative(ROOT, file);
-  // `.h` resolves C vs C++ by content — the same call the indexer makes.
-  const lang = extLang === 'detect' ? detectLanguage(rel, source) : extLang;
+  // `.h` resolves C vs C++ by content — the same call the indexer makes; so
+  // does `.inc` (PHP vs Pascal, #2279 — a Pascal include is not a kernel file).
+  const lang =
+    extLang === 'detect' || extLang === 'javascript' || extLang === 'jsx' || path.extname(file).toLowerCase() === '.inc'
+      ? detectLanguage(rel, source)
+      : extLang;
   if (!KERNEL_LANGS.has(lang)) continue;
   if (langFilter && !langFilter.has(lang)) continue;
   processed++;

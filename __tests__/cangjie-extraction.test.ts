@@ -6,7 +6,7 @@ import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/gramma
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'kernel-parity', 'torture.cj');
 
-describe('Cangjie 1.0.5 extraction', () => {
+describe('Cangjie 1.0.6 extraction', () => {
   beforeAll(async () => {
     await initGrammars();
     await loadGrammarsForLanguages(['cangjie']);

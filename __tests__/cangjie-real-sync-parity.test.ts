@@ -6,8 +6,7 @@ import { CodeGraph, loadGrammarsForLanguages } from '../src';
 import type { Edge, Node } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
 
-const CORPUS_ROOT = path.resolve(__dirname, '..', '..', '.test', 'plotmore');
-const corpusAvailable = fs.existsSync(path.join(CORPUS_ROOT, 'src', 'core', 'scale.cj'));
+const CORPUS_ROOT = path.resolve(__dirname, 'fixtures', 'cangjie-1.0.6', 'codegraph-sync');
 
 function copySourceTree(source: string, destination: string): void {
   fs.mkdirSync(destination, { recursive: true });
@@ -51,13 +50,13 @@ function graphSnapshot(graph: CodeGraph): { nodes: string[]; edges: string[] } {
   };
 }
 
-describe.skipIf(!corpusAvailable)('Cangjie real-project sync parity', () => {
+describe('Cangjie executable-project sync parity', () => {
   let temporaryRoot = '';
   let graph: CodeGraph;
 
   beforeAll(async () => {
     await loadGrammarsForLanguages(['cangjie']);
-    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plotmore-sync-'));
+    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cangjie-project-sync-'));
     copySourceTree(CORPUS_ROOT, temporaryRoot);
     graph = CodeGraph.initSync(temporaryRoot);
     await graph.indexAll();
@@ -94,7 +93,7 @@ describe.skipIf(!corpusAvailable)('Cangjie real-project sync parity', () => {
       file: 'src/core/scale_test.cj',
     });
     const testText = testNode.content[0]?.text ?? '';
-    expect(testText).toContain('src/core/scale_test.cj:7');
+    expect(testText).toContain('src/core/scale_test.cj:8');
     expect(testText).toContain('**Decorators:** @Test');
 
     await graph.indexAll();

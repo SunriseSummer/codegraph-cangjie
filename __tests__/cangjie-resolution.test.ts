@@ -542,7 +542,7 @@ afterAll(() => {
   if (projectDir) fs.rmSync(projectDir, { recursive: true, force: true });
 });
 
-describe('Cangjie 1.0.5 reference resolution', () => {
+describe('Cangjie 1.0.6 reference resolution', () => {
   it('keeps bare calls in the Cangjie package and language', () => {
     const caller = oneNode('exercise', 'function', 'src/main.cj');
     const helper = oneNode('helper', 'function', 'src/main.cj');

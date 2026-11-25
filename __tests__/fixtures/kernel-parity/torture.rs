@@ -72,6 +72,16 @@ impl Widget {
         self.n * mul()
     }
 
+    /// Receiver shapes (#1585): only `self.<field>.<method>()` keeps the
+    /// owner-field prefix; deeper / parenthesized / call / bare-self collapse.
+    fn via_field(&self) -> u32 {
+        self.field.deep_call();
+        self.field.z.clone();
+        self.method_a().chain_b();
+        (self.field).deep_call();
+        self.area()
+    }
+
     fn clone_self(&self) -> Self {
         Self::assoc();
         Widget {
@@ -105,6 +115,87 @@ impl<T> Container<T> {
 
 impl Render for Container<u32> {
     fn render(&self) {}
+}
+
+/// Receiver = the impl_item's `type` field (#1588): generic, lifetime,
+/// reference, scoped, and generic-trait impls all qualify by the TYPE.
+pub trait Source {
+    fn read(&mut self) -> usize;
+}
+
+pub struct FileSource {
+    pub n: usize,
+}
+
+impl Source for FileSource {
+    fn read(&mut self) -> usize {
+        self.n
+    }
+}
+
+pub struct BufSource<T> {
+    pub inner: T,
+}
+
+impl<T> Source for BufSource<T> {
+    fn read(&mut self) -> usize {
+        0
+    }
+}
+
+pub struct Parents<'a> {
+    cur: &'a u32,
+}
+
+impl<'a> Iterator for Parents<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        None
+    }
+}
+
+impl<T: Clone> Container<T> {
+    fn dup(&self) -> T {
+        self.item.clone()
+    }
+}
+
+impl Base for &Widget {}
+
+impl<T> Render for &mut BufSource<T> {
+    fn render(&self) {}
+}
+
+impl Base for self::Deep {}
+
+impl From<u32> for FileSource {
+    fn from(n: u32) -> Self {
+        FileSource { n: n as usize }
+    }
+}
+
+impl Base for (u32, u32) {}
+
+impl Render for dyn Base {
+    fn render(&self) {}
+}
+
+impl Base for u32 {}
+
+// Associated items are qualified by the impl's type; one no single name
+// stands for keeps the impl's spelling, whitespace collapsed.
+impl Render for (u32,
+                 u32) {
+    type Out = u8;
+    const PAIR: usize = 2;
+}
+
+impl<'a> Render for &'a [u8] {
+    type Out = u16;
+}
+
+impl Render for u64 {
+    const WIDTH: usize = 8;
 }
 
 impl Later {
@@ -178,6 +269,19 @@ fn wiring(mut o: Holder) {
     let (t1, t2) = (cb_a, cb_b);
     invoke_all(arr);
     invoke(foo_single);
+    // Functions passed through their path (#3254); a variant, a constant, a
+    // generic path and one with a comment in it are none.
+    let _ = opt.map(Graph::counts);
+    let _ = v.iter().map(crate::util::helper);
+    register(m::helper2);
+    let p = Self::helper;
+    let q = [m::cb_c, r#mod::r#fn];
+    let s = Holder { cb: other::handler };
+    let _ = zs.map(m ::  spaced);
+    let _ = xs.map(Kind::Wrap);
+    let _ = ys.map(Limits::MAX);
+    let _ = ws.map(Vec::<u8>::new);
+    let _ = us.map(m::/* c */commented);
 }
 
 static CB: fn() = handler;
@@ -208,4 +312,48 @@ fn mount() {
     let skipped = rocket::routes![a::x];
 }
 
+// Calls in an expression macro's arguments (#3251); another macro's are not read.
+fn macro_calls(v: &Vis, x: Option<u8>) {
+    println!("{} {}", label(), v.a.b());
+    assert_eq!(count(), m::size::<u8>(2), "{}", Mode::A.flip());
+    let _ = vec![make(); 3];
+    let _ = matches!(x, Some(n) if n.is_power_of_two());
+    other_macro!(not_read(), at_all());
+}
+
 routes![top_level_h];
+
+// Initializer walks attributed to the declared symbol (#693).
+const INIT_CONST: usize = compute_len();
+static INIT_LAZY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+static INIT_ALIAS: fn() = free_fn;
+// A table the walk above takes for its symbol, and the scan no longer for the file.
+static INIT_TABLE: &[fn()] = &[handler, handler2];
+
+pub union Reg {
+    pub raw: u32,
+    pub halves: [u16; 2],
+}
+
+impl Base for Reg {}
+
+// Turbofish calls name the function they wrap: `s.get::<u32>()` is `s.get`,
+// and a path's type arguments drop (`TfPool::<u8>::new` is `TfPool::new`),
+// nested ones and a `->` inside them included.
+fn turbofish_calls(s: &TfStore, items: &[u8]) {
+    let _a = s.get::<u32>();
+    let _b = tf_free::<Vec<u8>>();
+    let _c = TfPool::<u8>::new();
+    let _d = TfPool::<Vec<u8>>::with_capacity::<u8>(4);
+    let _e = TfPool::<u8>::new().len();
+    let _f = TfPool::create::<u8>().len();
+    let _g = tf_run::<fn() -> u8>(tf_free);
+    let _h = items.iter().collect::<Vec<_>>();
+}
+
+impl TfStore {
+    fn turbofish_self(&self) {
+        self.get::<u16>();
+        self.cache.load::<u8>();
+    }
+}

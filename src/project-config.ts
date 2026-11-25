@@ -67,6 +67,33 @@ export interface ProjectConfig {
    * wins. Absent/empty (the default) forces nothing in.
    */
   include?: string[];
+  /**
+   * Gitignore-style patterns for paths that should still be INDEXED and
+   * findable, but must not outrank first-party code in search ranking (#982).
+   *
+   * The ranking counterpart to `exclude`: `exclude` is a recall lever (the
+   * content leaves the index entirely), this is a relevance lever (the content
+   * stays, it just stops winning). It generalizes the built-in
+   * example/sample/fixture/benchmark de-prioritization to trees only the
+   * project knows about — an `optional-skills/` or `scripts/` directory whose
+   * helpers share generic symbol names with real code. Matched against
+   * project-root-relative paths, so `"optional-skills/"`, a recursive glob, or
+   * `"tools/gen"` all work. Absent/empty (the default) de-prioritizes nothing
+   * beyond the built-ins.
+   */
+  deprioritize?: string[];
+  /**
+   * The folder a PHP site's web server serves, which `$_SERVER['DOCUMENT_ROOT']`
+   * holds at run time (#3298): `"public"`, `"web"`, `"htdocs"`, or `"."` for the
+   * project root. Relative to the project root. With it set, an include built
+   * from it, like `require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`, links
+   * to `public/inc/header.php`. Absent (the default), the folder is the one the
+   * project's own includes settle on (resolution/php-web-root.ts), and an
+   * include they don't settle links nothing: the server configuration that
+   * names the folder isn't in the project, and a guess would link the wrong
+   * file wherever two folders hold one of the same name.
+   */
+  webRoot?: string;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -74,7 +101,10 @@ interface ParsedConfig {
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
+  deprioritize: string[];
   include: string[];
+  /** Project-root-relative, `/`-separated, no trailing `/`; '' is the project root. Null when unset or invalid. */
+  webRoot: string | null;
 }
 
 interface CacheEntry {
@@ -97,6 +127,8 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
+  deprioritize: Object.freeze([]) as unknown as string[],
+  webRoot: null,
 });
 
 /**
@@ -149,15 +181,49 @@ function parseConfig(file: string): ParsedConfig {
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
+  const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const webRoot = extractWebRoot(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
-    include.length === 0
+    include.length === 0 &&
+    deprioritize.length === 0 &&
+    webRoot === null
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include };
+  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot };
+}
+
+/**
+ * Validate `webRoot`: a folder inside the project, written relative to its
+ * root (`"public"`, `"./web/"`, `"site\\htdocs"`, `"."`). Returned with `/`
+ * separators and no `./` or trailing `/`; the project root is ''. A non-string,
+ * an empty string, an absolute path (the server's own path, like
+ * `/var/www/html`, which says nothing about where the folder sits in the
+ * project) or one that leaves the project warns and counts as unset; never
+ * throws.
+ */
+function extractWebRoot(parsed: object, file: string): string | null {
+  const raw = (parsed as ProjectConfig).webRoot;
+  if (raw === undefined) return null;
+  const hint = 'must be a folder relative to the project root, like "public", or "." for the root itself';
+  if (typeof raw !== 'string' || !raw.trim()) {
+    logWarn(`Ignoring "webRoot" in ${PROJECT_CONFIG_FILENAME}: it ${hint}`, { file });
+    return null;
+  }
+  const slashed = raw.trim().replace(/\\/g, '/');
+  if (slashed.startsWith('/') || /^[A-Za-z]:/.test(slashed)) {
+    logWarn(`Ignoring "webRoot" in ${PROJECT_CONFIG_FILENAME}: "${raw}" is an absolute path; it ${hint}`, { file });
+    return null;
+  }
+  const normalized = path.posix.normalize(slashed).replace(/\/+$/, '');
+  if (normalized === '..' || normalized.startsWith('../')) {
+    logWarn(`Ignoring "webRoot" in ${PROJECT_CONFIG_FILENAME}: "${raw}" is outside the project; it ${hint}`, { file });
+    return null;
+  }
+  return normalized === '.' ? '' : normalized;
 }
 
 /**
@@ -203,6 +269,29 @@ function extractIncludeIgnored(parsed: object, file: string): string[] {
   for (const entry of raw) {
     if (typeof entry !== 'string' || !entry.trim()) {
       logWarn(`Ignoring an "includeIgnored" entry in ${PROJECT_CONFIG_FILENAME}: every pattern must be a non-empty string`, { file });
+      continue;
+    }
+    out.push(entry.trim());
+  }
+  return out;
+}
+
+/**
+ * Validate a gitignore-style pattern list under `key`. A non-array value or a
+ * non-string/blank entry warns-and-skips; never throws. Patterns are kept
+ * verbatim (trimmed) so they match exactly as a `.gitignore` line would.
+ */
+function extractPatternList(parsed: object, file: string, key: 'deprioritize'): string[] {
+  const raw = (parsed as ProjectConfig)[key];
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "${key}" in ${PROJECT_CONFIG_FILENAME}: must be an array of gitignore-style patterns`, { file });
+    return [];
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(`Ignoring a "${key}" entry in ${PROJECT_CONFIG_FILENAME}: every pattern must be a non-empty string`, { file });
       continue;
     }
     out.push(entry.trim());
@@ -326,6 +415,17 @@ export function loadExcludePatterns(rootDir: string): string[] {
 }
 
 /**
+ * Load the validated `deprioritize` patterns for a project, mtime-cached.
+ *
+ * These name indexed paths that must not outrank first-party code (#982) — the
+ * ranking counterpart to `exclude`. An empty result — the zero-config default —
+ * de-prioritizes nothing beyond the built-in example/fixture/benchmark dirs.
+ */
+export function loadDeprioritizePatterns(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).deprioritize;
+}
+
+/**
  * Load the validated `include` patterns for a project, mtime-cached.
  *
  * These name first-party source to force INTO the index even when `.gitignore`
@@ -336,6 +436,17 @@ export function loadExcludePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/**
+ * Load the project's validated `webRoot`, mtime-cached: the folder PHP's
+ * `$_SERVER['DOCUMENT_ROOT']` names, relative to the project root with `/`
+ * separators ('' for the root itself), or null when `codegraph.json` sets none
+ * (the zero-config default, under which the folder is inferred from the
+ * project's includes where they settle it; see resolution/php-web-root.ts).
+ */
+export function loadWebRoot(rootDir: string): string | null {
+  return loadParsedConfig(rootDir).webRoot;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

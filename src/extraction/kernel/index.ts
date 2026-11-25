@@ -15,6 +15,8 @@
  */
 
 import type { ExtractionResult, Language } from '../../types';
+import { commonJsRequireRefs } from '../commonjs-requires';
+import { indexParseBudgetMs, parseTimeoutResult } from '../parse-budget';
 import { EXTRACTORS } from '../languages';
 import { getKernel, kernelSupports } from './loader';
 import { decodeExtractBuffers } from './decode';
@@ -110,7 +112,7 @@ const DEFAULT_ROUTED: ReadonlySet<Language> = new Set<Language>([
   // --max-deferral 0.3; the RATE, not the count, is the signal (flutter
   // HEAD drifts).
   'dart',
-  // Cangjie 1.0.5: the native and WASM grammars share generated sources;
+  // Cangjie 1.0.6: the native and WASM grammars share generated sources;
   // focused LF/CRLF semantic parity covers declarations, primary constructors,
   // properties, extensions, inheritance, calls and field reads.
   'cangjie',
@@ -142,6 +144,32 @@ const POST_PASSES: Partial<Record<Language, KernelPostPass>> = {
 function preParsedSource(filePath: string, source: string, language: Language): string {
   const pre = EXTRACTORS[language]?.preParse;
   return pre ? pre(source, filePath) : source;
+}
+
+/**
+ * Whether the file's re-exports keep their statements as written while the
+ * kernel reads the preParsed bytes (`reExportAsWritten`: TypeScript's
+ * `export type *`, #2474). The decoded result then takes those import nodes'
+ * signatures from `source`, as TreeSitterExtractor does, and the undecoded
+ * fast path steps aside for it.
+ */
+function keepsReExportsAsWritten(source: string, pre: string, language: Language): boolean {
+  return pre !== source && EXTRACTORS[language]?.reExportAsWritten?.(source) === true;
+}
+
+/** Each re-export import node's signature, read from `source` by the node's span. */
+function restoreReExportSignatures(result: ExtractionResult, source: string): void {
+  let lineStarts: number[] | null = null;
+  for (const node of result.nodes) {
+    if (node.kind !== 'import' || !node.signature?.startsWith('export')) continue;
+    if (!lineStarts) {
+      lineStarts = [0];
+      for (let i = source.indexOf('\n'); i !== -1; i = source.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+    }
+    const start = lineStarts[node.startLine - 1]! + node.startColumn;
+    const end = lineStarts[node.endLine - 1]! + node.endColumn;
+    node.signature = source.slice(start, end).trim();
+  }
 }
 
 function isRouted(language: Language): boolean {
@@ -176,6 +204,21 @@ const warned = new Set<string>();
  */
 let deferSlot: { filePath: string; source: string; language: Language; pre: string } | null = null;
 
+/**
+ * One-slot timeout memo, beside deferSlot: the LAST file whose native parse
+ * ran past its budget (`timeout:`, #3274). Its decoded-path retry answers
+ * from here instead of parsing again, and no file that times out takes the
+ * wasm path, which runs the same tree-sitter and would only spend the budget
+ * a second time.
+ */
+let timeoutSlot: { filePath: string; source: string; language: Language; budgetMs: number } | null = null;
+
+/** The budget a just-timed-out file ran past, if it matches. */
+function takeTimedOut(filePath: string, source: string, language: Language): number | null {
+  return timeoutSlot && timeoutSlot.filePath === filePath && timeoutSlot.source === source &&
+    timeoutSlot.language === language ? timeoutSlot.budgetMs : null;
+}
+
 /** The hoisted preParse output for a just-deferred file, if it matches. */
 export function takeDeferredPreParse(
   filePath: string,
@@ -206,7 +249,9 @@ export interface KernelRawResult {
  * so the main thread never materializes per-node objects. Returns null under
  * exactly the conditions tryKernelExtract does, PLUS when the language has a
  * registered post() pass (post passes operate on decoded results, so those
- * languages keep the decoded path).
+ * languages keep the decoded path), and for a file whose re-exports keep their
+ * statements as written (keepsReExportsAsWritten), which the decoded path
+ * restores.
  */
 export function tryKernelExtractRaw(
   filePath: string,
@@ -217,9 +262,13 @@ export function tryKernelExtractRaw(
   const kernel = getKernel();
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
+  if (takeTimedOut(filePath, source, language) !== null) return null; // already timed out
   const pre = preParsedSource(filePath, source, language);
+  // Its signatures come from the source as written, which needs the decoded path.
+  if (keepsReExportsAsWritten(source, pre, language)) return null;
+  const budgetMs = indexParseBudgetMs(pre.length);
   try {
-    const buffers = kernel.extractFile(filePath, pre, language);
+    const buffers = kernel.extractFile(filePath, pre, language, budgetMs);
     const meta = buffers.meta;
     if (meta.readUInt8(LAYOUT_META.version) !== LAYOUT_ABI) {
       throw new Error(`kernel buffer ABI ${meta.readUInt8(0)} != expected ${LAYOUT_ABI}`);
@@ -242,6 +291,11 @@ export function tryKernelExtractRaw(
     const message = err instanceof Error ? err.message : String(err);
     if (message.includes('defer:')) {
       deferSlot = { filePath, source, language, pre };
+      return null;
+    }
+    // The decoded path (extractFromSource) records the timeout from the slot.
+    if (message.startsWith('timeout:')) {
+      timeoutSlot = { filePath, source, language, budgetMs };
       return null;
     }
     if (!warned.has(language)) {
@@ -273,6 +327,8 @@ export function materializeKernelResult(
     language
   );
   decoded.durationMs = result.durationMs;
+  // References read beside the tables (a CommonJS `require`) ride on the transport.
+  if (result.unresolvedReferences.length > 0) decoded.unresolvedReferences.push(...result.unresolvedReferences);
   return decoded;
 }
 
@@ -292,12 +348,18 @@ export function tryKernelExtract(
   const kernel = getKernel();
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
+  const timedOut = takeTimedOut(filePath, source, language);
+  if (timedOut !== null) return parseTimeoutResult(filePath, timedOut);
   const t0 = Date.now();
   const pre = preParsedSource(filePath, source, language);
+  const budgetMs = indexParseBudgetMs(pre.length);
   try {
-    const buffers = kernel.extractFile(filePath, pre, language);
+    const buffers = kernel.extractFile(filePath, pre, language, budgetMs);
     const result = decodeExtractBuffers(buffers, filePath, language);
+    if (keepsReExportsAsWritten(source, pre, language)) restoreReExportSignatures(result, source);
     POST_PASSES[language]?.(result, source);
+    // Read beside the tables, as TreeSitterExtractor does (a CommonJS `require`).
+    result.unresolvedReferences.push(...commonJsRequireRefs(filePath, source, language));
     result.durationMs = Date.now() - t0;
     return result;
   } catch (err) {
@@ -308,6 +370,12 @@ export function tryKernelExtract(
     if (message.includes('defer:')) {
       deferSlot = { filePath, source, language, pre };
       return null;
+    }
+    // A parse that ran past its budget is the file's result: the wasm path
+    // runs the same tree-sitter and would spend the budget again.
+    if (message.startsWith('timeout:')) {
+      timeoutSlot = { filePath, source, language, budgetMs };
+      return parseTimeoutResult(filePath, budgetMs);
     }
     if (!warned.has(language)) {
       warned.add(language);

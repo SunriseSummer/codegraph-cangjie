@@ -1,0 +1,7 @@
+[package]
+  cjc-version = "1.0.6"
+  name = "codegraph_concurrency"
+  version = "1.0.0"
+  output-type = "executable"
+
+[dependencies]

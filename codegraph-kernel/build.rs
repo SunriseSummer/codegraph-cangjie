@@ -1,16 +1,20 @@
 fn main() {
     napi_build::setup();
 
-    // Kotlin grammar — vendored C, compiled here instead of a crate dep: the
-    // crates.io tree-sitter-kotlin 0.3.8 pins `tree-sitter >= 0.21, < 0.23`
-    // (the kernel links 0.25) and tree-sitter-kotlin-ng is a DIFFERENT
-    // grammar (8 fields vs 0, renamed kinds — extractor-breaking). Sources
-    // are the fwcd 0.3.8 tag's checked-in generated artifacts, sha-matched
-    // against the crates.io tarball (kotlin checklist §Grammar prep):
-    //   parser.c  54104a7ef1555c265b746c790e0f8bb953cc17806e9df0c3af82f7f62c06a70a
-    //   scanner.c 27f73337ec357fc341fa57538f34c14277b0346980c3405dc30beab6202ec6d0
-    // Flags crib the tarball's own bindings/rust/build.rs.
+    // Kotlin grammar — vendored C, compiled here instead of a crate dep: no
+    // crates.io release carries this revision (tree-sitter-kotlin 0.3.8 also
+    // pins `tree-sitter >= 0.21, < 0.23`; the kernel links 0.25), and
+    // tree-sitter-kotlin-ng is a DIFFERENT grammar (renamed kinds —
+    // extractor-breaking). Sources are fwcd/tree-sitter-kotlin commit
+    // d6af96d2e23ef0a8ff5ab512864378cf08fba311's checked-in generated
+    // artifacts, unpatched, the same ones the vendored wasm is built from
+    // (docs/grammars/tree-sitter-kotlin.md):
+    //   parser.c  d489e0ee02b320ffc1a67c55245b0e150317dfd80321678370c2a2145a0111f3
+    //   scanner.c a3c22a33953365af2b6a9408fd7c3828d4c1e83fb95a4ce29a854410ee16e99b
+    // Flags crib the commit's own bindings/rust/build.rs (c11: the scanner
+    // has a _Static_assert, which MSVC accepts only from /std:c11).
     let mut c = cc::Build::new();
+    c.std("c11");
     c.include("grammars/kotlin");
     c.file("grammars/kotlin/parser.c");
     c.file("grammars/kotlin/scanner.c");
@@ -41,14 +45,13 @@ fn main() {
     println!("cargo:rerun-if-changed=grammars/lua");
 
     // Scala grammar — vendored C (third vendored-grammar-C language): the
-    // vendored wasm is tree-sitter/tree-sitter-scala master@0aca5d0a6f (the
-    // 2026-04-22 generation sync — 30 states PAST the v0.26.0 tag/crate, so a
-    // crate pin would be a silent downgrade). Sources are that commit's
-    // checked-in generated artifacts, sha-recorded in the scala checklist
-    // §Grammar prep:
-    //   parser.c  bc3c3c794f19461d99d04de6c31d57fa3e41243509b9ab023a9b88ed3273d102
-    //   scanner.c e4ba242568ee3493015598997bf60f613802616eade62717c21109287ef64752
-    // parser.c is 35 MB — the biggest grammar in the tree; expect a slow cc
+    // vendored wasm is the tree-sitter/tree-sitter-scala v0.26.2 release asset,
+    // and these sources are the same tag's checked-in generated artifacts
+    // (#1823 — the previous master@0aca5d0a6f pin truncated an `extends`
+    // clause after a parent with several argument lists):
+    //   parser.c  9f6d03fa6c63d2d855b6f9e0368046a58568587eefc38b5e38bdb001e8ec68db
+    //   scanner.c daed58e6cf61f5b034adf51029c566141da5fb181540b77c8a28654a26e4ddd7
+    // parser.c is ~27 MB — the biggest grammar in the tree; expect a slow cc
     // step on clean builds.
     let mut scala = cc::Build::new();
     scala.include("grammars/scala");
@@ -61,18 +64,16 @@ fn main() {
     scala.compile("tree-sitter-scala");
     println!("cargo:rerun-if-changed=grammars/scala");
 
-    // Dart grammar — vendored C (fourth vendored-grammar-C language): the
-    // production wasm is the tree-sitter-wasms 0.1.13 artifact, whose dart
-    // dependency is an UNPINNED github:UserNobody14/tree-sitter-dart — the
-    // vendored wasm byte-copy (src/extraction/wasm/) plus these same-commit
-    // sources kill that hazard. crates.io tree-sitter-dart is the nielsenko
-    // FORK (different lineage) — rejected. Sources are
-    // UserNobody14/tree-sitter-dart master@d4d8f3e337d8 (dart checklist
-    // §Grammar prep):
-    //   parser.c  5a42b47abb4d494f125dbdee9138979248041689b1aa36355550fa3e28dcb8b8
+    // Dart grammar — vendored C (fourth vendored-grammar-C language). Sources
+    // are UserNobody14/tree-sitter-dart master@0038280b774b (2026-10-18; Dart
+    // 3.13 primary constructors, #3270), byte-identical to the commit's src/,
+    // and src/extraction/wasm/tree-sitter-dart.wasm is built from the same
+    // files (docs/grammars/tree-sitter-dart.md):
+    //   parser.c  9570f47f9912a4b169f5d959f6db06859087eb95c3f1203e312a33c12da66309
     //   scanner.c 07a7b7818b175e9460523e705dd88d20f7b5141bac95c593d4426e6d52284996
-    // scanner.c is load-bearing: string-template char classes and /** */ doc
-    // comments are external tokens.
+    // crates.io tree-sitter-dart is the nielsenko FORK (different lineage) —
+    // rejected. scanner.c is load-bearing: string-template char classes and
+    // /** */ doc comments are external tokens.
     let mut dart = cc::Build::new();
     dart.include("grammars/dart");
     dart.file("grammars/dart/parser.c");
@@ -85,7 +86,30 @@ fn main() {
     dart.compile("tree-sitter-dart");
     println!("cargo:rerun-if-changed=grammars/dart");
 
-    // Cangjie 1.0.5 grammar — generated parser and scanner are vendored from
+    // Swift grammar — vendored C (fifth vendored-grammar-C language): the
+    // crates.io tree-sitter-swift 0.7.4 tarball's src/ (#3212), the same
+    // sources the vendored wasm is built from (swift checklist §Grammar prep),
+    // with docs/grammars/tree-sitter-swift.patch applied to scanner.c: its
+    // out-of-memory report uses stdio, which a wasm parser lacks, and both
+    // are built from one scanner. (0.7.4 also carries the `1ULL <<
+    // FAKE_TRY_BANG` fix the previous patch added for MSVC's `try!`.)
+    //   parser.c  1d332e60ec28e6b398db36e06bf05414061dfbbd3e981b33ff1edfd5159e3e08
+    //   scanner.c b0abca0bb8d9e34da210ef0fac14f67c4fb40cb2625c4e51bd42ea80ac59d1b1
+    //   scanner.c 2b78cad2a49da126388acfa67fdac585226f89cd2feaf4326e98289bc253bf87 (patched)
+    // Flags crib the tarball's own bindings/rust/build.rs (c11). parser.c is
+    // ~20 MB.
+    let mut swift = cc::Build::new();
+    swift.std("c11");
+    swift.include("grammars/swift");
+    swift.file("grammars/swift/parser.c");
+    swift.file("grammars/swift/scanner.c");
+    swift.flag_if_supported("-Wno-unused-parameter");
+    swift.flag_if_supported("-Wno-unused-but-set-variable");
+    swift.flag_if_supported("-Wno-trigraphs");
+    swift.flag_if_supported("-utf-8"); // msvc
+    swift.compile("tree-sitter-swift");
+    println!("cargo:rerun-if-changed=grammars/swift");
+    // Cangjie 1.0.6 grammar — generated parser and scanner are vendored from
     // the companion treesitter-cangjie workspace. The native and WASM paths
     // therefore expose identical node/field tables.
     let mut cangjie = cc::Build::new();
