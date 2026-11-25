@@ -24,6 +24,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Integrated Cangjie parsing with upstream's native parse timeout and recursive stack guards.
 - Added lexical-scope-aware constant/function-value dependencies, retained recursive calls, and prevented local callbacks from linking to same-named global functions.
+- Recognized numbered Cangjie releases during daemon upgrades so an older background server releases its writer lock and the new session can take over.
 - Preserved Cangjie overload argument hints through the new shared reference-resurrection path without changing other languages' resolution hints.
 - Combined upstream's overload-aware reindexing and strict test-path detection with Cangjie's `.cj` test conventions.
 - Pointed install, upgrade and release paths at the new branch; release tags explicitly target the tested dispatch commit.

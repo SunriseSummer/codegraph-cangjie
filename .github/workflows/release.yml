@@ -17,13 +17,20 @@ name: Release
 # release.yml as their npm trusted publisher, delete that secret. npm then
 # automatically uses OIDC trusted publishing for later releases.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      reuse_kernel_run_id:
+        description: Optional run with completed kernel artifacts; exact native source equality is required
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: cangjie-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
+  actions: read       # read verified kernel artifacts from an earlier run
   contents: write      # create the GitHub Release + tag
   id-token: write      # OIDC token for npm --provenance and Sigstore signing
   attestations: write  # store the GitHub artifact attestations for the bundles
@@ -60,7 +67,31 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      - name: Verify native sources before reusing prebuilds
+        if: inputs.reuse_kernel_run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_kernel_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'Invalid run ID'; exit 1; }
+          SOURCE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSE_RUN_ID" --jq '.head_sha')
+          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          # These inputs determine the native binary and its TS wire contract.
+          # Any difference requires a fresh native build, never a stale cache.
+          git diff --exit-code "$SOURCE_SHA" HEAD -- codegraph-kernel scripts/build-kernel.sh src/types.ts src/extraction/kernel
+          echo "Verified native source equality with $SOURCE_SHA"
+      - name: Reuse verified native prebuilds
+        if: inputs.reuse_kernel_run_id != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-${{ matrix.runner }}
+          run-id: ${{ inputs.reuse_kernel_run_id }}
+          github-token: ${{ github.token }}
+          path: codegraph-kernel/prebuilds/
       - name: Build kernel prebuilds
+        if: inputs.reuse_kernel_run_id == ''
         shell: bash
         run: |
           for t in ${{ matrix.targets }}; do
@@ -159,6 +190,8 @@ jobs:
           if [ -f release/kernel/linux-x64/codegraph-kernel.node ]; then
             mkdir -p codegraph-kernel/prebuilds/linux-x64
             cp release/kernel/linux-x64/codegraph-kernel.node codegraph-kernel/prebuilds/linux-x64/
+            # Fail fast on the daemon handover contract before the large suite.
+            CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/daemon-older-version.test.ts --maxWorkers=1
             CANGJIE_TEST_TOOLCHAIN=1 CODEGRAPH_KERNEL_EXPECT=1 npm test -- --maxWorkers=4
           else
             echo "::error::linux-x64 kernel prebuild missing despite required matrix"

@@ -41,21 +41,37 @@ export const CodeGraphPackageVersion = readPackageVersion();
 /**
  * Whether `version` is a CodeGraph release older than `than` — the test a
  * launcher applies before it replaces a running daemon (#2335). Only plain
- * `MAJOR.MINOR.PATCH` releases compare: a prerelease, a build suffix or the
- * "0.0.0-unknown" sentinel is never older. A daemon is replaced only by a
- * strictly newer release, so two installed versions can never take turns
- * stopping each other's daemon.
+ * `MAJOR.MINOR.PATCH` releases and this distribution's canonical Cangjie
+ * release train compare. Other prereleases, build suffixes and the unknown
+ * sentinel remain incomparable. Cangjie suffixes are numbered releases, not
+ * development builds; rejecting them would leave an old daemon holding the
+ * writer lock after every Cangjie upgrade.
  */
 export function isOlderRelease(version: string, than: string): boolean {
   const a = parseRelease(version);
   const b = parseRelease(than);
   if (!a || !b) return false;
-  if (a[0] !== b[0]) return a[0] < b[0];
-  if (a[1] !== b[1]) return a[1] < b[1];
-  return a[2] < b[2];
+  for (let i = 0; i < 3; i++) {
+    if (a.core[i] !== b.core[i]) return a.core[i]! < b.core[i]!;
+  }
+  // At the same upstream version this distribution extends the plain
+  // release. The reverse must never replace it and cause daemon ping-pong.
+  if (!a.cangjie || !b.cangjie) return !a.cangjie && !!b.cangjie;
+  for (let i = 0; i < 4; i++) {
+    if (a.cangjie[i] !== b.cangjie[i]) return a.cangjie[i]! < b.cangjie[i]!;
+  }
+  return false;
 }
 
-function parseRelease(version: string): [number, number, number] | null {
-  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+interface ReleaseVersion {
+  core: number[];
+  cangjie?: number[];
+}
+
+function parseRelease(version: string): ReleaseVersion | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-cangjie-(\d+)\.(\d+)\.(\d+)\.(\d+))?$/.exec(version);
+  if (!m) return null;
+  const numbers = m.slice(1).filter((part): part is string => part !== undefined).map(Number);
+  if (!numbers.every(Number.isSafeInteger)) return null;
+  return { core: numbers.slice(0, 3), ...(numbers.length === 7 ? { cangjie: numbers.slice(3) } : {}) };
 }

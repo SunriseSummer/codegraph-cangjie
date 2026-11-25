@@ -8,13 +8,13 @@ Canonical project guidance for coding agents working in this repository (Codex/A
 
 CodeGraph is a local-first code intelligence library + CLI + MCP server. It parses any supported codebase with tree-sitter, stores symbols/edges/files in SQLite (FTS5), and exposes a knowledge graph to AI agents (Claude Code, Cursor, Codex CLI, opencode) over MCP. Per-project data lives in `.codegraph/`. Extraction is deterministic — derived from AST, not LLM-summarized.
 
-Distributed as `@colbymchenry/codegraph` on npm; same binary serves as installer, indexer, and MCP server.
+Distributed as `@cangjie-lang/codegraph` on npm; same binary serves as installer, indexer, and MCP server.
 
 ## Build, Test, Run
 
 ```bash
 npm run build           # tsc + copy schema.sql and *.wasm + build the viewer into dist/; chmods dist/bin/codegraph.js
-npm run build:lib       # the viewer's components as @colbymchenry/codegraph-ui (ui/dist) — NOT part of `build`
+npm run build:lib       # the viewer's components as @cangjie-lang/codegraph-ui (ui/dist) — NOT part of `build`
 npm run dev             # tsc --watch
 npm run clean           # rm -rf dist
 
@@ -40,7 +40,7 @@ highlighting reads a file with the same grammar the engine indexed it with, so a
 unhighlighted screen as well as an extraction gap.
 
 `npm run build:lib` is separate and does NOT run as part of `npm run build`: it compiles the same
-`ui/src` tree a second way, with `svelte-package`, into `ui/dist` — the `@colbymchenry/codegraph-ui`
+`ui/src` tree a second way, with `svelte-package`, into `ui/dist` — the `@cangjie-lang/codegraph-ui`
 component library the Pro app imports (task CG-61). `scripts/check-ui-package.mjs` then prunes the
 standalone app's shell out of it, resolves the extensionless import specifiers `svelte-package`
 leaves behind, and asserts the seam: nothing outside `lib/adapter.js` may reach the network. The
@@ -100,7 +100,7 @@ Defined in `src/types.ts`. Both extractors and resolvers must use these exact st
 
 ### Multi-agent installer
 
-`src/installer/` is the entry point for `codegraph install` (and the bare `codegraph`/`npx @colbymchenry/codegraph` invocation). Architecture:
+`src/installer/` is the entry point for `codegraph install` (and the bare `codegraph`/`npx @cangjie-lang/codegraph` invocation). Architecture:
 
 - `targets/registry.ts` lists every supported agent.
 - `targets/types.ts` defines the `AgentTarget` interface — adding another agent (Continue, Zed…) is **one new file in `targets/` + one entry in `registry.ts`**. Each target owns its config-file location and MCP-server JSON/TOML/JSONC writing. (Claude, Codex, Gemini, opencode, Droid, Qwen, DSH, Grok, Kimi and Pi also write a short instructions-file block — see below.)
@@ -221,11 +221,11 @@ For any Windows-specific PR, bug, or implementation, validate it on the real Win
 
 ## Releases
 
-Released to npm and mirrored as [GitHub Releases](https://github.com/colbymchenry/codegraph/releases). `CHANGELOG.md` is the source of truth; GitHub Release notes are extracted from it.
+Released to npm and mirrored as [GitHub Releases](https://github.com/SunriseSummer/codegraph-cangjie/releases). `CHANGELOG.md` is the source of truth; GitHub Release notes are extracted from it.
 
 ### Writing changelog entries
 
-**Default: write entries under `## [Unreleased]`** — that's the section reserved for work landing between releases. **Don't pre-create a `## [X.Y.Z]` block** for the next release: the Release workflow's first step is `scripts/prepare-release.mjs`, which automatically promotes everything under `[Unreleased]` into a new `## [X.Y.Z] - <YYYY-MM-DD>` block at release time (or merges into a pre-existing `[X.Y.Z]` block if one exists — but you don't need one). Pre-staging is what caused the v0.9.5 sparse-release-notes incident: a sparse `[0.9.5]` block hand-added before the rest of the work landed got picked by the extractor over the much-larger `[Unreleased]` section above it. Don't do that.
+**Default: write entries under `## [Unreleased]`** for work landing between releases. When a release is explicitly requested, prepare its complete `## [X.Y.Z] - <YYYY-MM-DD>` block before dispatching the workflow. This fork validates committed metadata instead of running upstream's automatic changelog preparation. Include all changes intended for the release; a sparse version block would omit them from the extracted release notes.
 
 Formatting rules for any entry (anywhere — `[Unreleased]` or otherwise):
 
@@ -237,48 +237,30 @@ Formatting rules for any entry (anywhere — `[Unreleased]` or otherwise):
 6. **Every release opens with a `### Highlights` block — the only part most people read.** At most ~8 one-line bullets, in plain language for someone who doesn't read code, ordered by what a typical user notices first (new agent/IDE support and setup changes, then answer quality, then reliability), plus a one-sentence upgrade note when a re-index is needed. Write or refresh it in `[Unreleased]` when a release is being prepared — not per PR — and keep the detailed `### New Features` / `### Fixes` entries below it. When `### Fixes` grows past ~15 entries, group them under `####` sub-headings (`Better answers from codegraph_explore`, `Finding your project, live updates, and the CLI`, `Indexing reliability and disk usage`, `Language and framework accuracy`) so a skimmer can find their area.
 7. **Keep a release's block well under 125,000 characters**, GitHub's limit for a release body. `scripts/extract-release-notes.mjs` cuts a longer block before the first entry that doesn't fit and links the rest to CHANGELOG.md, so the release still publishes, but everything after the cut is missing from the release page. (1.6.3's `[Unreleased]` reached 300,000 characters: one sentence per entry is what keeps a release this size whole.)
 
-Multi-word headings like `### New Features` are safe on the normal release path: `prepare-release.mjs` **Case A** moves the whole `[Unreleased]` body verbatim into `[X.Y.Z]`. (Only its rarely-used **Case B** *merge* splits sub-sections with a single-word `^### (\w+)$` regex that wouldn't match them — and Case B fires only if a `[X.Y.Z]` block was pre-created, which rule above already forbids.)
+Multi-word headings like `### New Features` are supported by the release-note extractor. The fork workflow does not run `prepare-release.mjs` or merge changelog sections automatically.
 
-### Release flow (the user runs these)
+### Release flow
 
-Releases are built and published by the **GitHub Actions "Release" workflow**
-(`.github/workflows/release.yml`). It runs `scripts/prepare-release.mjs` to
-promote `[Unreleased]` into `[<version>]` (and auto-commit + push that
-CHANGELOG change back to `main` so on-disk truth matches the published
-notes), then bundles a Node runtime per platform (`scripts/build-bundle.sh`)
-and publishes both the GitHub Release and the npm thin-installer
-(`scripts/pack-npm.sh`: a shim package + per-platform packages).
-Publishing manually is **wrong** now — a plain `npm publish` ships the root
-package (non-bundled), which breaks anyone on Node < 22.5.
+This fork publishes numbered Cangjie releases on `cangjie-1.0.6`, using the
+seven existing public `@cangjie-lang/codegraph*` packages. The separate UI
+workspace remains private; the viewer stays behind upstream's feature flag.
 
-**Claude does NOT bump the version unless explicitly asked.** The maintainer
-typically does it themselves — often by editing `package.json` directly via
-the GitHub web UI. Don't proactively commit a version bump as part of
-unrelated work, and don't propose one when summarizing a PR.
+When the user explicitly requests a release, prepare matching versions in
+`package.json`, `package-lock.json` and `ui/package.json`, and a populated
+version block in `CHANGELOG.md`. The fork's workflow validates committed
+metadata and never auto-edits the source or promotes `[Unreleased]`.
 
-When the maintainer DOES bump the version, the only edit strictly required is
-to `package.json` — the workflow's "Sync package-lock.json" step detects a
-mismatch between `package.json` and `package-lock.json`, runs
-`npm install --package-lock-only --ignore-scripts` to rewrite the lock file's
-version fields (top-level + `packages.""`), and auto-commits + pushes the
-result back to `main` with `[skip ci]`. So a GitHub-web-UI single-file edit to
-`package.json` is enough to kick off a clean release. (If they edit both files
-locally, that's fine too — the sync step no-ops.) Bump `ui/package.json` to the
-same version in that change: the component library is versioned with the
-engine, `ui-package.test.ts` pins it, and the workflow does not sync it — the
-1.6.1 bump left `main` red on exactly that.
+Run the GitHub Actions `Release` workflow on the requested branch. It builds
+six native targets, runs Cangjie tests on the platform runners, runs the full
+suite with the official Cangjie SDK, verifies installed npm tarballs, then
+creates the GitHub Release and publishes the generated npm packages. An
+optional previous run may supply native artifacts only after a strict diff
+proves equality of the native sources and wire-contract inputs. Tests still
+run on the current commit. The release tag targets that exact tested commit.
 
-Once `package.json` is at the target version on `main`, trigger
-**Actions → Release → Run workflow** (on `main`). The workflow:
-
-1. Syncs `package-lock.json` to `package.json`'s version if they've drifted; commits + pushes that change.
-2. Runs `prepare-release.mjs <X.Y.Z>` → promotes `[Unreleased]` → `[X.Y.Z] - <today>` in `CHANGELOG.md`, appends the link reference, commits + pushes the move with `[skip ci]`.
-3. Builds every platform bundle on one runner, generates `SHA256SUMS`.
-4. Creates the GitHub Release with notes from the freshly-promoted `[X.Y.Z]` block.
-5. Publishes the npm shim + per-platform packages. Requires the `NPM_TOKEN` repo secret.
-
-**Do not run `npm publish`, `git push`, or `git tag` yourself** — these are
-publish actions on shared state. Write the files, hand the user the commands.
+Use the generated packages and workflow; publishing the repository root
+would omit the bundled runtime. Only push/tag/publish when the user has
+explicitly authorized those actions.
 
 ## House rules
 
@@ -292,3 +274,7 @@ publish actions on shared state. Write the files, hand the user the commands.
   - The **current branch's tip** — your own unmerged work obviously can't be what the comment is reacting to.
   Always disambiguate "released," "merged-but-unreleased," and "in-progress" before agreeing that a user-reported problem is unfixed (or that a fix is incomplete). A user saying "your fix only covers X" about a recent PR is usually pointing at the *released* shortcomings — your in-flight branch may already address them but they have no way to know that.
 - **Version-tag every image referenced in `README.md`.** GitHub caches README images (`raw.githubusercontent.com` with a 5-minute TTL; third-party hosts sit behind the long-lived camo proxy), so updating an asset in place can keep showing the stale version. Give each README image URL a `?v=N` query tag and **bump `N` in the same commit whenever the asset bytes change** — e.g. `assets/waitlist.svg?v=2`. The changed URL sidesteps every cache so the new image shows immediately instead of waiting on a TTL to expire.
+
+## Cangjie adaptation
+
+This branch targets Cangjie SDK 1.0.6 and retains the compatible 1.0.5 grammar. Keep native/WASM parity, package visibility, overload hints, lexical shadowing and sync/full equality covered. `src/mcp/version.ts` recognizes canonical Cangjie release numbers for daemon handover while rejecting unrelated prerelease and unknown versions. See `docs/cangjie-1.0.6-validation.md` for coverage.

@@ -28,6 +28,10 @@ upstream's new indexing, resolver, daemon, CLI and Web viewer code.
 5. The Cangjie native walker now participates in upstream's parse deadline and
    stack guards. Its block binding lookup is cached per file so repeated value
    reads do not repeatedly scan all declarations of a long function.
+6. Upstream's daemon handover accepted plain versions only, so every numbered
+   Cangjie release was treated as an incomparable development build. The fork's
+   canonical release train now compares numerically, including adaptation patch
+   numbers, while unknown/beta/build versions still cannot authorize a stop.
 
 ## Coverage
 
